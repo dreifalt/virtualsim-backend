@@ -17,15 +17,26 @@ const {
   normalizePhoneNumber,
   safeEqual,
   verifyAdMobSignature,
-  verifyPlivoSignature
+  verifyTelnyxSignature
 } = require("./security");
+const {
+  TelnyxApiError,
+  createCredentialConnection,
+  deleteCredentialConnection,
+  inventoryRecord,
+  listPurchasedNumbers,
+  parseInboundSms,
+  updatePhoneNumberConnection
+} = require("./telnyx");
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-const PLIVO_AUTH_TOKEN = process.env.PLIVO_AUTH_TOKEN;
-const PLIVO_WEBHOOK_URL = process.env.PLIVO_WEBHOOK_URL;
+const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+const TELNYX_PUBLIC_KEY = process.env.TELNYX_PUBLIC_KEY;
+const TELNYX_VIP_TAG = process.env.TELNYX_VIP_TAG || "vip";
+const TELNYX_SYNC_INTERVAL_MS = Number(process.env.TELNYX_SYNC_INTERVAL_MS || 15 * 60 * 1000);
 const PLAY_PACKAGE_NAME = process.env.PLAY_PACKAGE_NAME || "com.virtualsim.pro";
 const VIP_PRODUCT_ID = process.env.VIP_PRODUCT_ID || "virtualsim_vip_number";
 const REWARD_CREDITS = Number(process.env.AD_REWARD_CREDITS || 1);
@@ -45,6 +56,9 @@ if (!DATA_KEY || DATA_KEY.length !== 32) {
 }
 if (!Number.isInteger(REWARD_CREDITS) || REWARD_CREDITS < 1) {
   throw new Error("AD_REWARD_CREDITS must be a positive integer.");
+}
+if (!Number.isInteger(TELNYX_SYNC_INTERVAL_MS) || TELNYX_SYNC_INTERVAL_MS < 60000) {
+  throw new Error("TELNYX_SYNC_INTERVAL_MS must be at least 60000.");
 }
 
 const pool = new Pool({ connectionString: DATABASE_URL });
@@ -66,7 +80,12 @@ const adminLimiter = rateLimit({
 
 app.disable("x-powered-by");
 app.use(helmet());
-app.use(express.json({ limit: "32kb" }));
+app.use(express.json({
+  limit: "32kb",
+  verify(req, _res, buffer) {
+    if (req.path === "/api/webhook/sms") req.rawBody = Buffer.from(buffer);
+  }
+}));
 app.use(express.urlencoded({ extended: false, limit: "32kb" }));
 
 const schema = `
@@ -86,10 +105,34 @@ CREATE TABLE IF NOT EXISTS phone_numbers (
   city text NOT NULL DEFAULT '',
   dialing_code text NOT NULL DEFAULT '',
   flag text NOT NULL DEFAULT '🌐',
-  number_type text NOT NULL CHECK (number_type IN ('FREE_ASSIGNED', 'VIP_PRIVATE')),
+  number_type text NOT NULL CHECK (number_type IN ('FREE_POOL', 'FREE_ASSIGNED', 'VIP_PRIVATE')),
+  telnyx_phone_number_id text,
+  telnyx_connection_id text,
   active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS telnyx_phone_number_id text;
+ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS telnyx_connection_id text;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'phone_numbers_number_type_check'
+      AND pg_get_constraintdef(oid) NOT LIKE '%FREE_POOL%'
+  ) THEN
+    ALTER TABLE phone_numbers DROP CONSTRAINT phone_numbers_number_type_check;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'phone_numbers_number_type_check'
+  ) THEN
+    ALTER TABLE phone_numbers
+      ADD CONSTRAINT phone_numbers_number_type_check
+      CHECK (number_type IN ('FREE_POOL', 'FREE_ASSIGNED', 'VIP_PRIVATE'));
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS phone_numbers_telnyx_id_idx
+  ON phone_numbers(telnyx_phone_number_id) WHERE telnyx_phone_number_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS phone_numbers_user_idx ON phone_numbers(user_id, active);
 CREATE TABLE IF NOT EXISTS sms_messages (
   id text PRIMARY KEY,
@@ -112,8 +155,12 @@ CREATE TABLE IF NOT EXISTS sip_accounts (
   password_ciphertext bytea NOT NULL,
   password_iv bytea NOT NULL,
   password_tag bytea NOT NULL,
+  telnyx_connection_id text,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE sip_accounts ADD COLUMN IF NOT EXISTS telnyx_connection_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS sip_accounts_telnyx_id_idx
+  ON sip_accounts(telnyx_connection_id) WHERE telnyx_connection_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS webhook_nonces (
   nonce text PRIMARY KEY,
   received_at timestamptz NOT NULL DEFAULT now()
@@ -214,10 +261,164 @@ function decryptCode(row) {
   );
 }
 
+function publicSipAccount(row) {
+  return {
+    domain: row.sip_domain,
+    username: row.sip_username,
+    password: decryptText(
+      row.password_ciphertext,
+      row.password_iv,
+      row.password_tag,
+      DATA_KEY
+    ),
+    connectionId: row.telnyx_connection_id
+  };
+}
+
+async function ensureTelnyxSipAccount(userId) {
+  const existing = await pool.query(
+    `SELECT sip_domain, sip_username, password_ciphertext, password_iv,
+            password_tag, telnyx_connection_id
+     FROM sip_accounts WHERE user_id = $1 AND telnyx_connection_id IS NOT NULL`,
+    [userId]
+  );
+  if (existing.rowCount > 0) return publicSipAccount(existing.rows[0]);
+  if (!TELNYX_API_KEY) throw new TelnyxApiError(503, "Telnyx SIP provisioning is not configured.");
+
+  const username = `vs${crypto.randomBytes(15).toString("hex")}`;
+  const password = crypto.randomBytes(32).toString("base64url");
+  let connectionId = null;
+  try {
+    connectionId = await createCredentialConnection({ username, password, userId });
+    const [ciphertext, iv, tag] = encryptedFields(password);
+    const inserted = await pool.query(
+      `INSERT INTO sip_accounts
+       (user_id, sip_domain, sip_username, password_ciphertext, password_iv,
+        password_tag, telnyx_connection_id)
+       VALUES ($1, 'sip.telnyx.com', $2, $3, $4, $5, $6)
+       ON CONFLICT (user_id) DO UPDATE SET
+         sip_domain = EXCLUDED.sip_domain,
+         sip_username = EXCLUDED.sip_username,
+         password_ciphertext = EXCLUDED.password_ciphertext,
+         password_iv = EXCLUDED.password_iv,
+         password_tag = EXCLUDED.password_tag,
+         telnyx_connection_id = EXCLUDED.telnyx_connection_id,
+         updated_at = now()
+       WHERE sip_accounts.telnyx_connection_id IS NULL
+       RETURNING sip_domain, sip_username, password_ciphertext, password_iv,
+                 password_tag, telnyx_connection_id`,
+      [userId, username, ciphertext, iv, tag, connectionId]
+    );
+    if (inserted.rowCount > 0) return publicSipAccount(inserted.rows[0]);
+
+    const concurrent = await pool.query(
+      `SELECT sip_domain, sip_username, password_ciphertext, password_iv,
+              password_tag, telnyx_connection_id
+       FROM sip_accounts WHERE user_id = $1 AND telnyx_connection_id IS NOT NULL`,
+      [userId]
+    );
+    if (concurrent.rowCount === 0) {
+      throw new Error("Telnyx SIP account could not be saved.");
+    }
+    await deleteCredentialConnection(connectionId);
+    connectionId = null;
+    return publicSipAccount(concurrent.rows[0]);
+  } catch (error) {
+    if (connectionId) {
+      try {
+        await deleteCredentialConnection(connectionId);
+      } catch (cleanupError) {
+        console.error(`Unable to remove an unused Telnyx SIP connection: ${cleanupError.message}`);
+      }
+    }
+    throw error;
+  }
+}
+
+let telnyxSyncStatus = { lastSuccessAt: null, importedNumbers: 0, skippedNumbers: 0 };
+
+async function syncTelnyxInventory() {
+  const providerNumbers = await listPurchasedNumbers();
+  const records = [];
+  let skippedNumbers = 0;
+  for (const providerNumber of providerNumbers) {
+    try {
+      const record = inventoryRecord(providerNumber, TELNYX_VIP_TAG);
+      if (record) records.push(record);
+      else skippedNumbers += 1;
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      skippedNumbers += 1;
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const record of records) {
+      await client.query(
+        `INSERT INTO phone_numbers
+         (id, phone_number, country, city, dialing_code, flag, number_type,
+          telnyx_phone_number_id, active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+         ON CONFLICT (phone_number) DO UPDATE SET
+           telnyx_phone_number_id = EXCLUDED.telnyx_phone_number_id,
+           country = EXCLUDED.country,
+           city = EXCLUDED.city,
+           dialing_code = EXCLUDED.dialing_code,
+           flag = EXCLUDED.flag,
+           number_type = CASE
+             WHEN phone_numbers.user_id IS NULL THEN EXCLUDED.number_type
+             ELSE phone_numbers.number_type
+           END,
+           active = true`,
+        [
+          crypto.randomUUID(),
+          record.phoneNumber,
+          record.country,
+          record.city,
+          record.dialingCode,
+          record.flag,
+          record.numberType,
+          record.telnyxPhoneNumberId
+        ]
+      );
+    }
+    await client.query(
+      `UPDATE phone_numbers SET active = false
+       WHERE telnyx_phone_number_id IS NOT NULL
+         AND NOT (telnyx_phone_number_id = ANY($1::text[]))`,
+      [records.map((record) => record.telnyxPhoneNumberId)]
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  telnyxSyncStatus = {
+    lastSuccessAt: new Date().toISOString(),
+    importedNumbers: records.length,
+    skippedNumbers
+  };
+  console.log(`Telnyx inventory sync completed: ${records.length} active numbers.`);
+  return telnyxSyncStatus;
+}
+
 app.get("/health", async (_req, res, next) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ status: "ok" });
+    res.json({
+      status: "ok",
+      telnyx: {
+        configured: Boolean(TELNYX_API_KEY),
+        webhookConfigured: Boolean(TELNYX_PUBLIC_KEY),
+        outboundVoiceProfileConfigured: Boolean(String(process.env.TELNYX_OUTBOUND_VOICE_PROFILE_ID || "").trim()),
+        lastInventorySync: telnyxSyncStatus.lastSuccessAt
+      }
+    });
   } catch (error) {
     next(error);
   }
@@ -274,7 +475,7 @@ function publicProfile(user, vipAvailable = false) {
 app.get("/api/profile", authenticate, async (req, res, next) => {
   try {
     const [available, vip] = await Promise.all([
-      pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE') AS available"),
+      pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE' AND telnyx_phone_number_id IS NOT NULL) AS available"),
       pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE') AS has_vip", [req.user.id])
     ]);
     return res.json({
@@ -313,6 +514,121 @@ app.get("/api/numbers", authenticate, async (req, res, next) => {
   }
 });
 
+app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
+  const existing = await pool.query(
+    `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active
+     FROM phone_numbers
+     WHERE user_id = $1 AND active AND number_type = 'FREE_ASSIGNED'
+     ORDER BY created_at LIMIT 1`,
+    [req.user.id]
+  );
+  if (existing.rowCount > 0) {
+    const row = existing.rows[0];
+    return res.json({ number: {
+      id: row.id,
+      country: row.country,
+      city: row.city,
+      dialingCode: row.dialing_code,
+      number: row.phone_number,
+      flag: row.flag,
+      label: row.number_type,
+      active: row.active
+    } });
+  }
+
+  let sipAccount;
+  try {
+    sipAccount = await ensureTelnyxSipAccount(req.user.id);
+  } catch (error) {
+    return next(error);
+  }
+
+  const client = await pool.connect();
+  let transactionStarted = false;
+  let providerAttached = false;
+  let providerNumberId = null;
+  let committed = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const alreadyClaimed = await client.query(
+      `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active
+       FROM phone_numbers
+       WHERE user_id = $1 AND active AND number_type = 'FREE_ASSIGNED'
+       ORDER BY created_at LIMIT 1 FOR UPDATE`,
+      [req.user.id]
+    );
+    if (alreadyClaimed.rowCount > 0) {
+      await client.query("COMMIT");
+      committed = true;
+      const row = alreadyClaimed.rows[0];
+      return res.json({ number: {
+        id: row.id,
+        country: row.country,
+        city: row.city,
+        dialingCode: row.dialing_code,
+        number: row.phone_number,
+        flag: row.flag,
+        label: row.number_type,
+        active: row.active
+      } });
+    }
+
+    const available = await client.query(
+      `SELECT id, telnyx_phone_number_id, country, city, dialing_code,
+              phone_number, flag, number_type, active
+       FROM phone_numbers
+       WHERE user_id IS NULL AND active AND number_type = 'FREE_POOL'
+         AND telnyx_phone_number_id IS NOT NULL
+       ORDER BY created_at LIMIT 1
+       FOR UPDATE SKIP LOCKED`
+    );
+    if (available.rowCount === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({ error: "No free numbers are currently available." });
+    }
+
+    const number = available.rows[0];
+    providerNumberId = number.telnyx_phone_number_id;
+    await updatePhoneNumberConnection(providerNumberId, sipAccount.connectionId);
+    providerAttached = true;
+    const updated = await client.query(
+      `UPDATE phone_numbers
+       SET user_id = $1, number_type = 'FREE_ASSIGNED', telnyx_connection_id = $2
+      WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'FREE_POOL'
+       RETURNING id, country, city, dialing_code, phone_number, flag, number_type, active`,
+      [req.user.id, sipAccount.connectionId, number.id]
+    );
+    if (updated.rowCount === 0) throw new Error("The free number could not be assigned.");
+    await client.query("COMMIT");
+    committed = true;
+    const row = updated.rows[0];
+    return res.status(201).json({ number: {
+      id: row.id,
+      country: row.country,
+      city: row.city,
+      dialingCode: row.dialing_code,
+      number: row.phone_number,
+      flag: row.flag,
+      label: row.number_type,
+      active: row.active
+    } });
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK");
+    if (providerAttached && !committed) {
+      try {
+        await updatePhoneNumberConnection(providerNumberId, null);
+      } catch (cleanupError) {
+        console.error(`Unable to detach an unassigned Telnyx number: ${cleanupError.message}`);
+      }
+    }
+    return next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/messages", authenticate, async (req, res, next) => {
   try {
     const result = await pool.query(
@@ -346,23 +662,14 @@ app.get("/api/messages", authenticate, async (req, res, next) => {
 app.get("/api/voip-config", authenticate, async (req, res, next) => {
   try {
     res.set("Cache-Control", "no-store");
-    const result = await pool.query(
-      "SELECT sip_domain, sip_username, password_ciphertext, password_iv, password_tag FROM sip_accounts WHERE user_id = $1",
-      [req.user.id]
-    );
-    const account = result.rows[0];
-    if (!account) return res.json({ configured: false });
-    const password = decryptText(
-      account.password_ciphertext,
-      account.password_iv,
-      account.password_tag,
-      DATA_KEY
-    );
+    const account = await ensureTelnyxSipAccount(req.user.id);
     return res.json({
       configured: true,
-      domain: account.sip_domain,
-      username: account.sip_username,
-      password
+      domain: account.domain,
+      username: account.username,
+      password: account.password,
+      transport: "TLS",
+      port: 5061
     });
   } catch (error) {
     return next(error);
@@ -410,27 +717,9 @@ app.post("/api/admin/numbers", adminLimiter, requireAdmin, async (req, res, next
 
 app.put("/api/admin/users/:userId/voip", adminLimiter, requireAdmin, async (req, res, next) => {
   try {
-    const domain = String(req.body.domain || "").trim();
-    const username = String(req.body.username || "").trim();
-    const password = String(req.body.password || "");
-    if (!domain || domain.includes("@") || /[\s/]/.test(domain) || !username || !password) {
-      return res.status(400).json({ error: "Provide a SIP domain, username, and password." });
-    }
     const user = await pool.query("SELECT 1 FROM users WHERE id = $1", [req.params.userId]);
     if (user.rowCount === 0) return res.status(404).json({ error: "User not found." });
-    const [ciphertext, iv, tag] = encryptedFields(password);
-    await pool.query(
-      `INSERT INTO sip_accounts (user_id, sip_domain, sip_username, password_ciphertext, password_iv, password_tag)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (user_id) DO UPDATE SET
-         sip_domain = EXCLUDED.sip_domain,
-         sip_username = EXCLUDED.sip_username,
-         password_ciphertext = EXCLUDED.password_ciphertext,
-         password_iv = EXCLUDED.password_iv,
-         password_tag = EXCLUDED.password_tag,
-         updated_at = now()`,
-      [req.params.userId, domain, username, ciphertext, iv, tag]
-    );
+    await ensureTelnyxSipAccount(req.params.userId);
     return res.status(204).end();
   } catch (error) {
     return next(error);
@@ -438,21 +727,51 @@ app.put("/api/admin/users/:userId/voip", adminLimiter, requireAdmin, async (req,
 });
 
 app.delete("/api/account", authenticate, async (req, res, next) => {
-  const client = await pool.connect();
+  let client;
+  let transactionStarted = false;
   try {
+    const [numbers, sip] = await Promise.all([
+      pool.query(
+        "SELECT telnyx_phone_number_id, telnyx_connection_id FROM phone_numbers WHERE user_id = $1",
+        [req.user.id]
+      ),
+      pool.query(
+        "SELECT telnyx_connection_id FROM sip_accounts WHERE user_id = $1",
+        [req.user.id]
+      )
+    ]);
+    const connectionId = sip.rows[0] && sip.rows[0].telnyx_connection_id;
+    if ((connectionId || numbers.rows.some((number) => number.telnyx_phone_number_id)) && !TELNYX_API_KEY) {
+      throw new TelnyxApiError(503, "Telnyx is unavailable for account cleanup. Please retry later.");
+    }
+    for (const number of numbers.rows) {
+      if (number.telnyx_phone_number_id && number.telnyx_connection_id) {
+        await updatePhoneNumberConnection(number.telnyx_phone_number_id, null);
+      }
+    }
+    if (connectionId) await deleteCredentialConnection(connectionId);
+
+    client = await pool.connect();
     await client.query("BEGIN");
+    transactionStarted = true;
     await client.query(
-      "UPDATE phone_numbers SET user_id = NULL, active = false WHERE user_id = $1",
+      `UPDATE phone_numbers
+       SET user_id = NULL,
+           active = CASE WHEN number_type = 'FREE_ASSIGNED' THEN true ELSE false END,
+           number_type = CASE WHEN number_type = 'FREE_ASSIGNED' THEN 'FREE_POOL' ELSE number_type END,
+           telnyx_connection_id = NULL
+       WHERE user_id = $1`,
       [req.user.id]
     );
     await client.query("DELETE FROM users WHERE id = $1", [req.user.id]);
     await client.query("COMMIT");
+    transactionStarted = false;
     return res.status(204).end();
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client && transactionStarted) await client.query("ROLLBACK");
     return next(error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -577,6 +896,7 @@ app.post("/api/store/verify-vip", authenticate, async (req, res, next) => {
 
     const tokenHash = crypto.createHash("sha256").update(purchaseToken).digest("hex");
     const client = await pool.connect();
+    let attachedNumberId = null;
     try {
       await client.query("BEGIN");
       const duplicate = await client.query(
@@ -588,28 +908,44 @@ app.post("/api/store/verify-vip", authenticate, async (req, res, next) => {
         return res.json({ verified: true, alreadyApplied: true });
       }
       const number = await client.query(
-        `SELECT id FROM phone_numbers
+        `SELECT id, telnyx_phone_number_id FROM phone_numbers
          WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-         ORDER BY created_at
-         FOR UPDATE SKIP LOCKED LIMIT 1`
+           AND telnyx_phone_number_id IS NOT NULL
+         ORDER BY created_at LIMIT 1
+         FOR UPDATE SKIP LOCKED`
       );
       if (number.rowCount === 0) {
         await client.query("ROLLBACK");
         return res.status(409).json({ error: "No VIP numbers are currently available." });
       }
       const numberId = number.rows[0].id;
-      await client.query(
-        "UPDATE phone_numbers SET user_id = $1 WHERE id = $2 AND user_id IS NULL",
-        [req.user.id, numberId]
+      const sipAccount = await ensureTelnyxSipAccount(req.user.id);
+      attachedNumberId = number.rows[0].telnyx_phone_number_id;
+      await updatePhoneNumberConnection(attachedNumberId, sipAccount.connectionId);
+      const assigned = await client.query(
+        `UPDATE phone_numbers
+         SET user_id = $1, telnyx_connection_id = $2
+         WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         RETURNING id`,
+        [req.user.id, sipAccount.connectionId, numberId]
       );
+      if (assigned.rowCount === 0) throw new Error("The VIP number could not be assigned.");
       await client.query(
         "INSERT INTO vip_purchases (purchase_token_hash, user_id, product_id, number_id) VALUES ($1, $2, $3, $4)",
         [tokenHash, req.user.id, productId, numberId]
       );
       await client.query("COMMIT");
+      attachedNumberId = null;
       return res.json({ verified: true, numberId });
     } catch (error) {
       await client.query("ROLLBACK");
+      if (attachedNumberId) {
+        try {
+          await updatePhoneNumberConnection(attachedNumberId, null);
+        } catch (cleanupError) {
+          console.error(`Unable to detach an unassigned VIP Telnyx number: ${cleanupError.message}`);
+        }
+      }
       throw error;
     } finally {
       client.release();
@@ -621,39 +957,29 @@ app.post("/api/store/verify-vip", authenticate, async (req, res, next) => {
 
 app.post("/api/webhook/sms", async (req, res, next) => {
   try {
-    if (!PLIVO_AUTH_TOKEN || !PLIVO_WEBHOOK_URL) {
-      return res.status(503).json({ error: "Plivo webhook verification is not configured." });
+    if (!TELNYX_PUBLIC_KEY) {
+      return res.status(503).json({ error: "Telnyx webhook verification is not configured." });
     }
-    const nonce = req.get("x-plivo-signature-v3-nonce");
-    const signature = req.get("x-plivo-signature-v3");
-    if (!verifyPlivoSignature({
-      url: PLIVO_WEBHOOK_URL,
-      nonce,
-      authToken: PLIVO_AUTH_TOKEN,
+    const signature = req.get("telnyx-signature-ed25519");
+    const timestamp = req.get("telnyx-timestamp");
+    if (!req.rawBody || !verifyTelnyxSignature({
+      rawBody: req.rawBody,
       signature,
-      params: req.body
+      timestamp,
+      publicKey: TELNYX_PUBLIC_KEY
     })) {
-      return res.status(401).json({ error: "Invalid Plivo webhook signature." });
+      return res.status(401).json({ error: "Invalid Telnyx webhook signature." });
     }
-    const from = String(req.body.From || "");
-    const to = normalizePhoneNumber(req.body.To);
-    const text = String(req.body.Text || "").slice(0, 4096);
-    const providerMessageId = String(req.body.MessageUUID || req.body.MessageUuid || "");
-    if (!from || !text || !providerMessageId) {
-      return res.status(400).json({ error: "Required Plivo message fields are missing." });
+    if (req.body?.data?.event_type !== "message.received") {
+      return res.status(200).json({ status: "ignored" });
     }
+    const message = parseInboundSms(req.body);
+    if (!message) return res.status(400).json({ error: "Required Telnyx message fields are missing." });
+    const providerMessageId = `telnyx:${message.messageId}`;
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const nonceInsert = await client.query(
-        "INSERT INTO webhook_nonces (nonce) VALUES ($1) ON CONFLICT DO NOTHING RETURNING nonce",
-        [nonce]
-      );
-      if (nonceInsert.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "Webhook nonce has already been used." });
-      }
       const eventInsert = await client.query(
         "INSERT INTO processed_sms (provider_message_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING provider_message_id",
         [providerMessageId]
@@ -664,15 +990,15 @@ app.post("/api/webhook/sms", async (req, res, next) => {
       }
       const number = await client.query(
         "SELECT id, user_id FROM phone_numbers WHERE phone_number = $1 AND active AND user_id IS NOT NULL FOR SHARE",
-        [to]
+        [message.to]
       );
       if (number.rowCount === 0) {
         await client.query("COMMIT");
         return res.status(202).json({ status: "unassigned number; message discarded" });
       }
       const owner = number.rows[0];
-      const body = encryptedFields(text);
-      const code = encryptedFields(extractOtp(text));
+      const body = encryptedFields(message.text);
+      const code = encryptedFields(extractOtp(message.text));
       await client.query(
         `INSERT INTO sms_messages
          (id, user_id, number_id, sender, body_ciphertext, body_iv, body_tag,
@@ -682,7 +1008,7 @@ app.post("/api/webhook/sms", async (req, res, next) => {
           providerMessageId,
           owner.user_id,
           owner.id,
-          from.slice(0, 32),
+          message.from.slice(0, 32),
           body[0], body[1], body[2],
           code[0], code[1], code[2]
         ]
@@ -704,6 +1030,10 @@ app.post("/api/webhook/sms", async (req, res, next) => {
 
 const errorHandler = (error, _req, res, _next) => {
   if (process.env.NODE_ENV !== "test") console.error(error.message);
+  if (error instanceof TelnyxApiError) {
+    const status = error.status === 503 ? 503 : 502;
+    return res.status(status).json({ error: error.message });
+  }
   return res.status(500).json({ error: "The server could not complete the request." });
 };
 app.use(errorHandler);
@@ -723,9 +1053,30 @@ async function start() {
     }
   }, 60 * 60 * 1000);
   cleanup.unref();
-  return app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`VirtualSIM backend listening on ${PORT}`);
   });
+  if (TELNYX_API_KEY) {
+    let syncing = false;
+    const runTelnyxSync = async () => {
+      if (syncing) return;
+      syncing = true;
+      try {
+        await syncTelnyxInventory();
+      } catch (error) {
+        console.error(`Telnyx inventory sync failed: ${error.message}`);
+      } finally {
+        syncing = false;
+      }
+    };
+    const syncTimer = setInterval(runTelnyxSync, TELNYX_SYNC_INTERVAL_MS);
+    syncTimer.unref();
+    setImmediate(runTelnyxSync);
+    server.on("close", () => clearInterval(syncTimer));
+  } else {
+    console.warn("Telnyx inventory sync is disabled because TELNYX_API_KEY is not configured.");
+  }
+  return server;
 }
 
 if (require.main === module) {
@@ -735,4 +1086,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, start };
+module.exports = { app, start, syncTelnyxInventory };

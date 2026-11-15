@@ -40,24 +40,51 @@ function decryptText(ciphertext, iv, tag, key) {
   ]).toString("utf8");
 }
 
-function plivoSignaturePayload(url, nonce, params) {
-  const fields = Object.entries(params)
-    .filter(([key, value]) => key && value !== undefined && value !== null)
-    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-    .map(([key, value]) => `${key}${value}`)
-    .join("");
-  return `${url}.${fields}.${nonce}`;
+function createEd25519PublicKey(value) {
+  const key = String(value || "").trim();
+  if (!key) throw new TypeError("Telnyx public key is not configured.");
+  if (key.includes("BEGIN PUBLIC KEY")) return crypto.createPublicKey(key);
+
+  const bytes = /^[0-9a-f]{64}$/i.test(key)
+    ? Buffer.from(key, "hex")
+    : Buffer.from(key, "base64");
+  if (bytes.length === 32) {
+    const spkiPrefix = Buffer.from("302a300506032b6570032100", "hex");
+    return crypto.createPublicKey({
+      key: Buffer.concat([spkiPrefix, bytes]),
+      format: "der",
+      type: "spki"
+    });
+  }
+  return crypto.createPublicKey({ key: bytes, format: "der", type: "spki" });
 }
 
-function verifyPlivoSignature({ url, nonce, authToken, signature, params }) {
-  if (!url || !nonce || !authToken || !signature) return false;
-  const expected = crypto
-    .createHmac("sha256", authToken)
-    .update(plivoSignaturePayload(url, nonce, params), "utf8")
-    .digest("base64");
-  return String(signature)
-    .split(",")
-    .some((candidate) => safeEqual(candidate.trim(), expected));
+function verifyTelnyxSignature({ rawBody, signature, timestamp, publicKey, now = Date.now() }) {
+  if (!rawBody || !signature || !timestamp || !publicKey || !/^\d+$/.test(String(timestamp))) {
+    return false;
+  }
+  const timestampSeconds = Number(timestamp);
+  if (!Number.isSafeInteger(timestampSeconds) ||
+      Math.abs(Math.floor(now / 1000) - timestampSeconds) > 300) {
+    return false;
+  }
+  const signatureBytes = Buffer.from(String(signature), "base64");
+  if (signatureBytes.length !== 64) return false;
+
+  try {
+    const signedPayload = Buffer.concat([
+      Buffer.from(`${timestamp}|`, "utf8"),
+      Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), "utf8")
+    ]);
+    return crypto.verify(
+      null,
+      signedPayload,
+      createEd25519PublicKey(publicKey),
+      signatureBytes
+    );
+  } catch (_error) {
+    return false;
+  }
 }
 
 function decodeBase64Key(value) {
@@ -102,8 +129,7 @@ module.exports = {
   encryptText,
   extractOtp,
   normalizePhoneNumber,
-  plivoSignaturePayload,
   safeEqual,
   verifyAdMobSignature,
-  verifyPlivoSignature
+  verifyTelnyxSignature
 };

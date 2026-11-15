@@ -8,10 +8,10 @@ const {
   encryptText,
   extractOtp,
   normalizePhoneNumber,
-  plivoSignaturePayload,
   verifyAdMobSignature,
-  verifyPlivoSignature
+  verifyTelnyxSignature
 } = require("./security");
+const { inventoryRecord, parseInboundSms } = require("./telnyx");
 
 test("phone number normalization accepts E.164 and rejects local numbers", () => {
   assert.equal(normalizePhoneNumber("+1 (212) 555-0148"), "+12125550148");
@@ -32,17 +32,64 @@ test("encrypted values round trip and authenticate their ciphertext", () => {
   assert.throws(() => decryptText(damaged, encrypted.iv, encrypted.tag, key));
 });
 
-test("Plivo V3 signatures cover URL, ordered parameters, and nonce", () => {
-  const url = "https://example.test/api/webhook/sms";
-  const nonce = "unique-nonce";
-  const authToken = "plivo-test-auth-token";
-  const params = { To: "+12125550148", Text: "OTP 482901", From: "+12125550149" };
-  const signature = crypto
-    .createHmac("sha256", authToken)
-    .update(plivoSignaturePayload(url, nonce, params))
-    .digest("base64");
-  assert.equal(verifyPlivoSignature({ url, nonce, authToken, signature, params }), true);
-  assert.equal(verifyPlivoSignature({ url, nonce, authToken, signature, params: { ...params, Text: "changed" } }), false);
+test("Telnyx Ed25519 signatures authenticate raw payloads and reject stale callbacks", () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" });
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const rawBody = Buffer.from('{"data":{"event_type":"message.received"}}');
+  const signature = crypto.sign(
+    null,
+    Buffer.concat([Buffer.from(`${timestamp}|`), rawBody]),
+    privateKey
+  ).toString("base64");
+  const input = { rawBody, signature, timestamp, publicKey: publicKeyPem };
+  assert.equal(verifyTelnyxSignature(input), true);
+  assert.equal(verifyTelnyxSignature({ ...input, rawBody: Buffer.from("tampered") }), false);
+  assert.equal(verifyTelnyxSignature({ ...input, timestamp: "1" }), false);
+});
+
+test("Telnyx inventory uses the VIP tag and maps supported countries", () => {
+  const number = inventoryRecord({
+    id: "provider-id",
+    phone_number: "+46701234567",
+    country_iso_alpha2: "SE",
+    status: "active",
+    tags: ["vip"]
+  });
+  assert.equal(number.country, "Sweden");
+  assert.equal(number.numberType, "VIP_PRIVATE");
+  assert.equal(inventoryRecord({
+    id: "free-id",
+    phone_number: "+12125550148",
+    country_iso_alpha2: "US",
+    status: "active",
+    tags: []
+  }).numberType, "FREE_POOL");
+  assert.equal(inventoryRecord({
+    id: "unsupported",
+    phone_number: "+999123456",
+    country_iso_alpha2: "ZZ",
+    status: "active",
+    tags: []
+  }), null);
+});
+
+test("Telnyx inbound parser accepts only complete received-message events", () => {
+  const message = parseInboundSms({
+    data: {
+      id: "event-id",
+      event_type: "message.received",
+      payload: {
+        id: "message-id",
+        from: { phone_number: "+12125550149" },
+        to: [{ phone_number: "+12125550148" }],
+        text: "Your code is 482901."
+      }
+    }
+  });
+  assert.equal(message.messageId, "message-id");
+  assert.equal(message.to, "+12125550148");
+  assert.equal(parseInboundSms({ data: { event_type: "message.sent" } }), null);
 });
 
 test("AdMob SSV callbacks require a valid ECDSA signature", () => {

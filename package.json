@@ -2,7 +2,7 @@
   "name": "virtualsim-master-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "Account-scoped VirtualSIM backend with Plivo SMS verification and protected SIP credentials",
+  "description": "Account-scoped VirtualSIM backend with Telnyx number inventory, SMS verification, and SIP provisioning",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
