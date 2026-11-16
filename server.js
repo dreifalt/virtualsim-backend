@@ -44,7 +44,22 @@ const TELNYX_SYNC_INTERVAL_MS = Number(process.env.TELNYX_SYNC_INTERVAL_MS || 15
 const PLAY_PACKAGE_NAME = process.env.PLAY_PACKAGE_NAME || "com.virtualsim.pro";
 const VIP_PRODUCT_ID = process.env.VIP_PRODUCT_ID || "virtualsim_vip_number";
 const VIP_CREDIT_COST = 50;
-const REWARD_CREDITS = Number(process.env.AD_REWARD_CREDITS || 1);
+const REWARD_CREDITS = 10;
+const STAGING_SHARED_FREE_NUMBERS_ENABLED =
+  process.env.NODE_ENV === "staging" && process.env.STAGING_SHARED_FREE_NUMBERS === "true";
+const STAGING_AD_REWARD_FALLBACK_ENABLED =
+  process.env.NODE_ENV === "staging" && process.env.STAGING_AD_REWARD_FALLBACK === "true";
+const STAGING_AD_FALLBACK_CREDITS = 10;
+const STAGING_SHARED_FREE_NUMBER = Object.freeze({
+  id: "staging-shared-free-us",
+  country: "United States",
+  city: "Synthetic test number",
+  dialingCode: "+1",
+  number: "+15555550100",
+  flag: "🇺🇸",
+  label: "FREE_SHARED",
+  active: true
+});
 const DATA_KEY = process.env.DATA_ENCRYPTION_KEY
   ? Buffer.from(process.env.DATA_ENCRYPTION_KEY, "base64")
   : null;
@@ -58,9 +73,6 @@ if (!ADMIN_API_KEY || Buffer.byteLength(ADMIN_API_KEY) < 32) {
 }
 if (!DATA_KEY || DATA_KEY.length !== 32) {
   throw new Error("DATA_ENCRYPTION_KEY must be a base64-encoded 32-byte key.");
-}
-if (!Number.isInteger(REWARD_CREDITS) || REWARD_CREDITS < 1) {
-  throw new Error("AD_REWARD_CREDITS must be a positive integer.");
 }
 if (!Number.isInteger(TELNYX_SYNC_INTERVAL_MS) || TELNYX_SYNC_INTERVAL_MS < 60000) {
   throw new Error("TELNYX_SYNC_INTERVAL_MS must be at least 60000.");
@@ -723,22 +735,37 @@ app.get("/api/profile", authenticate, async (req, res, next) => {
 app.get("/api/numbers", authenticate, async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT country, city, dialing_code, phone_number, flag, number_type, active
+      `SELECT country, city, dialing_code, phone_number, flag,
+              CASE
+                WHEN number_type IN ('FREE_POOL', 'FREE_ASSIGNED') THEN 'FREE_ASSIGNED'
+                ELSE number_type
+              END AS number_type,
+              active
        FROM phone_numbers
-       WHERE user_id = $1 AND active = true
-       ORDER BY CASE number_type WHEN 'FREE_ASSIGNED' THEN 0 ELSE 1 END, country`,
+       WHERE active = true
+         AND (
+           number_type IN ('FREE_POOL', 'FREE_ASSIGNED')
+           OR (number_type = 'VIP_PRIVATE' AND user_id = $1)
+         )
+       ORDER BY CASE number_type
+         WHEN 'FREE_POOL' THEN 0
+         WHEN 'FREE_ASSIGNED' THEN 1
+         ELSE 2
+       END, country`,
       [req.user.id]
     );
+    const numbers = result.rows.map((row) => ({
+      country: row.country,
+      city: row.city,
+      dialingCode: row.dialing_code,
+      number: row.phone_number,
+      flag: row.flag,
+      label: row.number_type,
+      active: row.active
+    }));
+    if (STAGING_SHARED_FREE_NUMBERS_ENABLED) numbers.unshift(STAGING_SHARED_FREE_NUMBER);
     return res.json({
-      numbers: result.rows.map((row) => ({
-        country: row.country,
-        city: row.city,
-        dialingCode: row.dialing_code,
-        number: row.phone_number,
-        flag: row.flag,
-        label: row.number_type,
-        active: row.active
-      }))
+      numbers
     });
   } catch (error) {
     return next(error);
@@ -773,7 +800,7 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
   const numberId = String(req.body?.numberId || "").trim();
   if (!numberId) return res.status(400).json({ error: "Select an available VIP number." });
 
-  let sipAccount;
+  let sipAccount = null;
   try {
     const user = await pool.query("SELECT credits FROM users WHERE id = $1", [req.user.id]);
     if (user.rowCount === 0) return res.status(404).json({ error: "User not found." });
@@ -789,7 +816,9 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
     if (number.rowCount === 0) {
       return res.status(409).json({ error: "The selected VIP number is no longer available." });
     }
-    sipAccount = await ensureTelnyxSipAccount(req.user.id);
+    if (isSipProvisioningConfigured()) {
+      sipAccount = await ensureTelnyxSipAccount(req.user.id);
+    }
   } catch (error) {
     return next(error);
   }
@@ -829,14 +858,17 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
       return res.status(409).json({ error: "The selected VIP number is no longer available." });
     }
 
-    attachedNumberId = number.rows[0].telnyx_phone_number_id;
-    await updatePhoneNumberConnection(attachedNumberId, sipAccount.connectionId);
+    const connectionId = sipAccount ? sipAccount.connectionId : null;
+    if (connectionId) {
+      attachedNumberId = number.rows[0].telnyx_phone_number_id;
+      await updatePhoneNumberConnection(attachedNumberId, connectionId);
+    }
     const assigned = await client.query(
       `UPDATE phone_numbers
        SET user_id = $1, telnyx_connection_id = $2
        WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
        RETURNING id`,
-      [req.user.id, sipAccount.connectionId, numberId]
+      [req.user.id, connectionId, numberId]
     );
     if (assigned.rowCount === 0) throw new Error("The VIP number could not be assigned.");
 
@@ -866,17 +898,21 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
   }
 });
 
-app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
-  const existing = await pool.query(
-    `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active,
-            telnyx_connection_id
-     FROM phone_numbers
-     WHERE user_id = $1 AND active AND number_type = 'FREE_ASSIGNED'
-     ORDER BY created_at LIMIT 1`,
-    [req.user.id]
-  );
-  if (existing.rowCount > 0) {
-    const row = existing.rows[0];
+app.post(["/api/numbers/claim-free", "/api/numbers/claim"], authenticate, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, country, city, dialing_code, phone_number, flag, active
+       FROM phone_numbers
+       WHERE active AND number_type IN ('FREE_POOL', 'FREE_ASSIGNED')
+       ORDER BY CASE number_type WHEN 'FREE_POOL' THEN 0 ELSE 1 END,
+                created_at, phone_number
+       LIMIT 1`
+    );
+    if (result.rowCount === 0) {
+      return res.status(409).json({ error: "No free numbers are currently available." });
+    }
+
+    const row = result.rows[0];
     return res.json({ number: {
       id: row.id,
       country: row.country,
@@ -884,111 +920,12 @@ app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
       dialingCode: row.dialing_code,
       number: row.phone_number,
       flag: row.flag,
-      label: row.number_type,
+      label: "FREE_ASSIGNED",
       active: row.active,
-      mode: row.telnyx_connection_id ? "VOICE_AND_SMS" : "SMS_ONLY"
-    } });
-  }
-
-  let sipAccount = null;
-  if (isSipProvisioningConfigured()) {
-    try {
-      sipAccount = await ensureTelnyxSipAccount(req.user.id);
-    } catch (error) {
-      return next(error);
-    }
-  }
-
-  const connectionId = sipAccount ? sipAccount.connectionId : null;
-  const client = await pool.connect();
-  let transactionStarted = false;
-  let providerAttached = false;
-  let providerNumberId = null;
-  let committed = false;
-  try {
-    await client.query("BEGIN");
-    transactionStarted = true;
-    const alreadyClaimed = await client.query(
-      `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active,
-              telnyx_connection_id
-       FROM phone_numbers
-       WHERE user_id = $1 AND active AND number_type = 'FREE_ASSIGNED'
-       ORDER BY created_at LIMIT 1 FOR UPDATE`,
-      [req.user.id]
-    );
-    if (alreadyClaimed.rowCount > 0) {
-      await client.query("COMMIT");
-      committed = true;
-      const row = alreadyClaimed.rows[0];
-      return res.json({ number: {
-        id: row.id,
-        country: row.country,
-        city: row.city,
-        dialingCode: row.dialing_code,
-        number: row.phone_number,
-        flag: row.flag,
-        label: row.number_type,
-        active: row.active,
-        mode: row.telnyx_connection_id ? "VOICE_AND_SMS" : "SMS_ONLY"
-      } });
-    }
-
-    const available = await client.query(
-      `SELECT id, telnyx_phone_number_id, country, city, dialing_code,
-              phone_number, flag, number_type, active
-       FROM phone_numbers
-       WHERE user_id IS NULL AND active AND number_type = 'FREE_POOL'
-         AND telnyx_phone_number_id IS NOT NULL
-       ORDER BY created_at LIMIT 1
-       FOR UPDATE SKIP LOCKED`
-    );
-    if (available.rowCount === 0) {
-      await client.query("ROLLBACK");
-      transactionStarted = false;
-      return res.status(409).json({ error: "No free numbers are currently available." });
-    }
-
-    const number = available.rows[0];
-    providerNumberId = number.telnyx_phone_number_id;
-    if (connectionId) {
-      await updatePhoneNumberConnection(providerNumberId, connectionId);
-      providerAttached = true;
-    }
-    const updated = await client.query(
-      `UPDATE phone_numbers
-       SET user_id = $1, number_type = 'FREE_ASSIGNED', telnyx_connection_id = $2
-      WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'FREE_POOL'
-       RETURNING id, country, city, dialing_code, phone_number, flag, number_type,
-                 active, telnyx_connection_id`,
-      [req.user.id, connectionId, number.id]
-    );
-    if (updated.rowCount === 0) throw new Error("The free number could not be assigned.");
-    await client.query("COMMIT");
-    committed = true;
-    const row = updated.rows[0];
-    return res.status(201).json({ number: {
-      id: row.id,
-      country: row.country,
-      city: row.city,
-      dialingCode: row.dialing_code,
-      number: row.phone_number,
-      flag: row.flag,
-      label: row.number_type,
-      active: row.active,
-      mode: row.telnyx_connection_id ? "VOICE_AND_SMS" : "SMS_ONLY"
+      mode: "PUBLIC_POOL"
     } });
   } catch (error) {
-    if (transactionStarted) await client.query("ROLLBACK");
-    if (providerAttached && !committed) {
-      try {
-        await updatePhoneNumberConnection(providerNumberId, null);
-      } catch (cleanupError) {
-        console.error(`Unable to detach an unassigned Telnyx number: ${cleanupError.message}`);
-      }
-    }
     return next(error);
-  } finally {
-    client.release();
   }
 });
 
@@ -1003,20 +940,30 @@ app.get("/api/messages", authenticate, async (req, res, next) => {
        LIMIT 100`,
       [req.user.id]
     );
-    return res.json({
-      messages: result.rows.map((row) => {
-        const message = decryptBody(row);
-        return {
-          id: row.id,
-          sender: row.sender,
-          service: row.sender,
-          time: row.created_at.toISOString(),
-          code: decryptCode(row),
-          message,
-          flag: "✉️"
-        };
-      })
+    const messages = result.rows.map((row) => {
+      const message = decryptBody(row);
+      return {
+        id: row.id,
+        sender: row.sender,
+        service: row.sender,
+        time: row.created_at.toISOString(),
+        code: decryptCode(row),
+        message,
+        flag: "✉️"
+      };
     });
+    if (STAGING_SHARED_FREE_NUMBERS_ENABLED) {
+      messages.unshift({
+        id: "staging-shared-free-test-message",
+        sender: "VirtualSIM Test",
+        service: "STAGING SYNTHETIC TEST",
+        time: new Date().toISOString(),
+        code: "246810",
+        message: "Synthetic staging-only OTP for testing. This message is not from Telnyx or a third-party service.",
+        flag: "🧪"
+      });
+    }
+    return res.json({ messages });
   } catch (error) {
     return next(error);
   }
@@ -1152,6 +1099,66 @@ app.post("/api/rewards/ad-token", authenticate, async (req, res, next) => {
   }
 });
 
+app.post("/api/rewards/staging-fallback", authenticate, async (req, res, next) => {
+  if (!STAGING_AD_REWARD_FALLBACK_ENABLED) {
+    return res.status(404).json({ error: "Staging ad fallback is not enabled." });
+  }
+
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const user = await client.query(
+      "SELECT credits FROM users WHERE id = $1 FOR UPDATE",
+      [req.user.id]
+    );
+    if (user.rowCount === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const transactionId = `staging-ad-fallback:${req.user.id}`;
+    const reward = await client.query(
+      `INSERT INTO ad_rewards (transaction_id, user_id, credits)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (transaction_id) DO NOTHING
+       RETURNING transaction_id`,
+      [transactionId, req.user.id, STAGING_AD_FALLBACK_CREDITS]
+    );
+    if (reward.rowCount === 0) {
+      await client.query("COMMIT");
+      transactionStarted = false;
+      return res.json({
+        granted: false,
+        alreadyClaimed: true,
+        credits: user.rows[0].credits
+      });
+    }
+
+    const updatedUser = await client.query(
+      "UPDATE users SET credits = credits + $1 WHERE id = $2 RETURNING credits",
+      [STAGING_AD_FALLBACK_CREDITS, req.user.id]
+    );
+    if (updatedUser.rowCount === 0) throw new Error("The staging reward could not be applied.");
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+    return res.json({
+      granted: true,
+      alreadyClaimed: false,
+      creditsAdded: STAGING_AD_FALLBACK_CREDITS,
+      credits: updatedUser.rows[0].credits
+    });
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK");
+    return next(error);
+  } finally {
+    client.release();
+  }
+});
+
 let admobKeysCache = { expiresAt: 0, keys: new Map() };
 async function getAdMobKey(keyId) {
   if (Date.now() >= admobKeysCache.expiresAt) {
@@ -1175,9 +1182,9 @@ app.get("/api/webhooks/admob", async (req, res, next) => {
     if (!verified || !verified.transactionId || !verified.customData) {
       return res.status(400).send("Invalid reward verification.");
     }
-    if (!Number.isFinite(verified.timestamp) ||
-        Math.abs(Date.now() - verified.timestamp) > 24 * 60 * 60 * 1000 ||
-        verified.rewardAmount !== REWARD_CREDITS) {
+    if (!Number.isFinite(verified.rewardAmount) || !Number.isInteger(verified.rewardAmount) || verified.rewardAmount < 1 ||
+        !Number.isFinite(verified.timestamp) ||
+        Math.abs(Date.now() - verified.timestamp) > 24 * 60 * 60 * 1000) {
       return res.status(400).send("Invalid reward callback.");
     }
 
