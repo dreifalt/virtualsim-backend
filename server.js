@@ -401,6 +401,8 @@ async function ensureTelnyxSipAccount(userId) {
   if (existing.rowCount > 0) return publicSipAccount(existing.rows[0]);
   if (!TELNYX_API_KEY) throw new TelnyxApiError(503, "Telnyx SIP provisioning is not configured.");
 
+  const configuredDomain = String(process.env.TELNYX_SIP_DOMAIN || "").trim();
+  const sipDomain = configuredDomain || "sip.telnyx.com";
   const username = `vs${crypto.randomBytes(15).toString("hex")}`;
   const password = crypto.randomBytes(32).toString("base64url");
   let connectionId = null;
@@ -411,7 +413,7 @@ async function ensureTelnyxSipAccount(userId) {
       `INSERT INTO sip_accounts
        (user_id, sip_domain, sip_username, password_ciphertext, password_iv,
         password_tag, telnyx_connection_id)
-       VALUES ($1, 'sip.telnyx.com', $2, $3, $4, $5, $6)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (user_id) DO UPDATE SET
          sip_domain = EXCLUDED.sip_domain,
          sip_username = EXCLUDED.sip_username,
@@ -423,7 +425,7 @@ async function ensureTelnyxSipAccount(userId) {
        WHERE sip_accounts.telnyx_connection_id IS NULL
        RETURNING sip_domain, sip_username, password_ciphertext, password_iv,
                  password_tag, telnyx_connection_id`,
-      [userId, username, ciphertext, iv, tag, connectionId]
+      [userId, sipDomain, username, ciphertext, iv, tag, connectionId]
     );
     if (inserted.rowCount > 0) return publicSipAccount(inserted.rows[0]);
 
@@ -658,7 +660,11 @@ app.post("/api/auth/phone/verify", phoneOtpVerifyLimiter, async (req, res, next)
     await client.query("COMMIT");
     transactionStarted = false;
     const user = result.rows[0];
-    return res.json({ token: createToken(user), profile: publicProfile(user) });
+    const hasVipNumber = await userHasActiveVipNumber(user.id);
+    return res.json({
+      token: createToken(user),
+      profile: publicProfile(user, false, hasVipNumber)
+    });
   } catch (error) {
     if (transactionStarted) await client.query("ROLLBACK");
     return next(error);
@@ -681,7 +687,10 @@ app.post("/api/auth/register", authLimiter, async (req, res, next) => {
       [id, email, passwordHash]
     );
     const user = result.rows[0];
-    return res.status(201).json({ token: createToken(user), profile: publicProfile(user) });
+    return res.status(201).json({
+      token: createToken(user),
+      profile: publicProfile(user)
+    });
   } catch (error) {
     if (error.code === "23505") return res.status(409).json({ error: "An account already exists for that email." });
     if (error instanceof TypeError) return res.status(400).json({ error: error.message });
@@ -699,19 +708,35 @@ app.post("/api/auth/login", authLimiter, async (req, res, next) => {
     const user = result.rows[0];
     const valid = await bcrypt.compare(String(req.body.password || ""), user?.password_hash || dummyPasswordHash);
     if (!user || !valid) return res.status(401).json({ error: "Email or password is incorrect." });
-    return res.json({ token: createToken(user), profile: publicProfile(user) });
+    const hasVipNumber = await userHasActiveVipNumber(user.id);
+    return res.json({
+      token: createToken(user),
+      profile: publicProfile(user, false, hasVipNumber)
+    });
   } catch (error) {
     if (error instanceof TypeError) return res.status(400).json({ error: error.message });
     return next(error);
   }
 });
 
-function publicProfile(user, vipAvailable = false) {
+async function userHasActiveVipNumber(userId) {
+  const result = await pool.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM phone_numbers
+       WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE'
+     ) AS has_vip`,
+    [userId]
+  );
+  return Boolean(result.rows[0]?.has_vip);
+}
+
+function publicProfile(user, vipAvailable = false, hasVipNumber = false) {
   return {
     id: user.id,
     email: user.email || user.phone_number,
     credits: user.credits,
-    vipAvailable
+    vipAvailable,
+    hasVipNumber
   };
 }
 
@@ -722,10 +747,11 @@ app.get("/api/profile", authenticate, async (req, res, next) => {
       pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE') AS has_vip", [req.user.id])
     ]);
     return res.json({
-      profile: {
-        ...publicProfile(req.user, available.rows[0].available),
-        hasVipNumber: vip.rows[0].has_vip
-      }
+      profile: publicProfile(
+        req.user,
+        Boolean(available.rows[0].available),
+        Boolean(vip.rows[0].has_vip)
+      )
     });
   } catch (error) {
     return next(error);
@@ -972,12 +998,73 @@ app.get("/api/messages", authenticate, async (req, res, next) => {
 app.get("/api/voip-config", authenticate, async (req, res, next) => {
   try {
     res.set("Cache-Control", "no-store");
+    const vip = await pool.query(
+      `SELECT id, phone_number, telnyx_phone_number_id, telnyx_connection_id
+       FROM phone_numbers
+       WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE'
+       ORDER BY created_at, id
+       LIMIT 1`,
+      [req.user.id]
+    );
+    if (vip.rowCount === 0) {
+      return res.json({
+        configured: false,
+        message: "Unlock a VIP number (50 CR) to enable outbound VoIP calling"
+      });
+    }
+    if (!vip.rows[0].telnyx_phone_number_id) {
+      return res.json({
+        configured: false,
+        message: "Your VIP number is not linked to Telnyx for outbound VoIP calling."
+      });
+    }
+    if (!isSipProvisioningConfigured()) {
+      return res.json({
+        configured: false,
+        message: "Telnyx SIP provisioning is not configured for this VIP account."
+      });
+    }
+
     const account = await ensureTelnyxSipAccount(req.user.id);
+    const number = vip.rows[0];
+    if (number.telnyx_connection_id !== account.connectionId) {
+      const restoreConnection = async () => {
+        try {
+          await updatePhoneNumberConnection(
+            number.telnyx_phone_number_id,
+            number.telnyx_connection_id || null
+          );
+        } catch (cleanupError) {
+          console.error(`Unable to restore the VIP number connection: ${cleanupError.message}`);
+        }
+      };
+      try {
+        await updatePhoneNumberConnection(number.telnyx_phone_number_id, account.connectionId);
+        const updated = await pool.query(
+          `UPDATE phone_numbers
+           SET telnyx_connection_id = $1
+           WHERE id = $2 AND user_id = $3 AND active AND number_type = 'VIP_PRIVATE'
+           RETURNING id`,
+          [account.connectionId, number.id, req.user.id]
+        );
+        if (updated.rowCount === 0) {
+          await restoreConnection();
+          return res.status(409).json({
+            configured: false,
+            message: "The VIP number assignment changed. Refresh and retry."
+          });
+        }
+      } catch (error) {
+        await restoreConnection();
+        throw error;
+      }
+    }
     return res.json({
       configured: true,
       domain: account.domain,
       username: account.username,
       password: account.password,
+      callerId: number.phone_number,
       transport: "TLS",
       port: 5061
     });
@@ -1029,6 +1116,11 @@ app.put("/api/admin/users/:userId/voip", adminLimiter, requireAdmin, async (req,
   try {
     const user = await pool.query("SELECT 1 FROM users WHERE id = $1", [req.params.userId]);
     if (user.rowCount === 0) return res.status(404).json({ error: "User not found." });
+    if (!await userHasActiveVipNumber(req.params.userId)) {
+      return res.status(409).json({
+        error: "Unlock a VIP number (50 CR) to enable outbound VoIP calling"
+      });
+    }
     await ensureTelnyxSipAccount(req.params.userId);
     return res.status(204).end();
   } catch (error) {
