@@ -3,6 +3,7 @@
 const { normalizePhoneNumber } = require("./security");
 
 const API_BASE_URL = "https://api.telnyx.com/v2";
+const SMS_SEND_ERROR = "Unable to send SMS to this number right now. Please try another country code or use Email & Password login.";
 const COUNTRY_DETAILS = Object.freeze({
   CA: { name: "Canada", dialingCode: "+1" },
   DE: { name: "Germany", dialingCode: "+49" },
@@ -125,6 +126,9 @@ async function telnyxRequest(path, { method = "GET", body, apiKey = process.env.
       continue;
     }
     if (!response.ok) {
+      if (url.pathname === "/v2/messages") {
+        console.error(`Telnyx SMS API rejected the request (${response.status}): ${rawResponse}`);
+      }
       throw new TelnyxApiError(response.status, "Telnyx rejected the API request.");
     }
     return payload;
@@ -183,14 +187,23 @@ async function sendSms({ to, text }) {
   if (!messagingProfileId) {
     throw new TelnyxApiError(503, "Telnyx messaging is not configured.");
   }
-  return telnyxRequest("/messages", {
-    method: "POST",
-    body: {
-      to,
-      messaging_profile_id: messagingProfileId,
-      text
+  try {
+    return await telnyxRequest("/messages", {
+      method: "POST",
+      body: {
+        to,
+        messaging_profile_id: messagingProfileId,
+        text
+      }
+    });
+  } catch (error) {
+    if (error instanceof TelnyxApiError &&
+        error.message !== "Telnyx messaging is not configured." &&
+        error.message !== "Telnyx API is not configured.") {
+      throw new TelnyxApiError(error.status, SMS_SEND_ERROR);
     }
-  });
+    throw error;
+  }
 }
 
 function isSipProvisioningConfigured() {

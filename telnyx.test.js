@@ -137,3 +137,35 @@ test("Telnyx sends app sign-in SMS through the configured messaging profile", as
     else process.env.TELNYX_MESSAGING_PROFILE_ID = originalMessagingProfileId;
   }
 });
+
+test("Telnyx SMS rejections return a friendly message and log the provider response", async () => {
+  const originalFetch = global.fetch;
+  const originalConsoleError = console.error;
+  const originalApiKey = process.env.TELNYX_API_KEY;
+  const originalMessagingProfileId = process.env.TELNYX_MESSAGING_PROFILE_ID;
+  const providerResponse = JSON.stringify({ errors: [{ detail: "Invalid destination number." }] });
+  const loggedMessages = [];
+  process.env.TELNYX_API_KEY = "test-api-key";
+  process.env.TELNYX_MESSAGING_PROFILE_ID = "messaging-profile-id";
+  global.fetch = async () => new Response(providerResponse, {
+    status: 400,
+    headers: { "content-type": "application/json" }
+  });
+  console.error = (...args) => loggedMessages.push(args.join(" "));
+
+  try {
+    await assert.rejects(
+      sendSms({ to: "+15551234567", text: "Your sign-in code is 123456." }),
+      (error) => error.status === 400 &&
+        error.message === "Unable to send SMS to this number right now. Please try another country code or use Email & Password login."
+    );
+    assert.ok(loggedMessages.some((message) => message.includes(providerResponse)));
+  } finally {
+    global.fetch = originalFetch;
+    console.error = originalConsoleError;
+    if (originalApiKey === undefined) delete process.env.TELNYX_API_KEY;
+    else process.env.TELNYX_API_KEY = originalApiKey;
+    if (originalMessagingProfileId === undefined) delete process.env.TELNYX_MESSAGING_PROFILE_ID;
+    else process.env.TELNYX_MESSAGING_PROFILE_ID = originalMessagingProfileId;
+  }
+});
