@@ -178,6 +178,13 @@ async function createCredentialConnection({ username, password, userId }) {
   return String(response.data.id);
 }
 
+function isSipProvisioningConfigured() {
+  return Boolean(
+    String(process.env.TELNYX_API_KEY || "").trim() &&
+    String(process.env.TELNYX_OUTBOUND_VOICE_PROFILE_ID || "").trim()
+  );
+}
+
 async function updatePhoneNumberConnection(phoneNumberId, connectionId) {
   try {
     await telnyxRequest(`/phone_numbers/${encodeURIComponent(phoneNumberId)}`, {
@@ -207,6 +214,7 @@ module.exports = {
   createCredentialConnection,
   deleteCredentialConnection,
   inventoryRecord,
+  isSipProvisioningConfigured,
   listPurchasedNumbers,
   parseInboundSms,
   telnyxRequest,

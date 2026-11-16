@@ -5,6 +5,7 @@ const test = require("node:test");
 const {
   createCredentialConnection,
   deleteCredentialConnection,
+  isSipProvisioningConfigured,
   telnyxRequest,
   updatePhoneNumberConnection
 } = require("./telnyx");
@@ -51,7 +52,12 @@ test("Telnyx SIP provisioning requires and attaches an outbound voice profile", 
       createCredentialConnection({ username: "testuser", password: "test-password", userId: "user-id" }),
       (error) => error.status === 503
     );
+    assert.equal(isSipProvisioningConfigured(), false);
+    delete process.env.TELNYX_API_KEY;
+    assert.equal(isSipProvisioningConfigured(), false);
+    process.env.TELNYX_API_KEY = "test-api-key";
     process.env.TELNYX_OUTBOUND_VOICE_PROFILE_ID = "voice-profile-id";
+    assert.equal(isSipProvisioningConfigured(), true);
     let requestBody;
     global.fetch = async (_url, options) => {
       requestBody = JSON.parse(options.body);

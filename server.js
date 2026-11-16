@@ -24,6 +24,7 @@ const {
   createCredentialConnection,
   deleteCredentialConnection,
   inventoryRecord,
+  isSipProvisioningConfigured,
   listPurchasedNumbers,
   parseInboundSms,
   updatePhoneNumberConnection
@@ -516,7 +517,8 @@ app.get("/api/numbers", authenticate, async (req, res, next) => {
 
 app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
   const existing = await pool.query(
-    `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active
+    `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active,
+            telnyx_connection_id
      FROM phone_numbers
      WHERE user_id = $1 AND active AND number_type = 'FREE_ASSIGNED'
      ORDER BY created_at LIMIT 1`,
@@ -532,17 +534,21 @@ app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
       number: row.phone_number,
       flag: row.flag,
       label: row.number_type,
-      active: row.active
+      active: row.active,
+      mode: row.telnyx_connection_id ? "VOICE_AND_SMS" : "SMS_ONLY"
     } });
   }
 
-  let sipAccount;
-  try {
-    sipAccount = await ensureTelnyxSipAccount(req.user.id);
-  } catch (error) {
-    return next(error);
+  let sipAccount = null;
+  if (isSipProvisioningConfigured()) {
+    try {
+      sipAccount = await ensureTelnyxSipAccount(req.user.id);
+    } catch (error) {
+      return next(error);
+    }
   }
 
+  const connectionId = sipAccount ? sipAccount.connectionId : null;
   const client = await pool.connect();
   let transactionStarted = false;
   let providerAttached = false;
@@ -552,7 +558,8 @@ app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
     await client.query("BEGIN");
     transactionStarted = true;
     const alreadyClaimed = await client.query(
-      `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active
+      `SELECT id, country, city, dialing_code, phone_number, flag, number_type, active,
+              telnyx_connection_id
        FROM phone_numbers
        WHERE user_id = $1 AND active AND number_type = 'FREE_ASSIGNED'
        ORDER BY created_at LIMIT 1 FOR UPDATE`,
@@ -570,7 +577,8 @@ app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
         number: row.phone_number,
         flag: row.flag,
         label: row.number_type,
-        active: row.active
+        active: row.active,
+        mode: row.telnyx_connection_id ? "VOICE_AND_SMS" : "SMS_ONLY"
       } });
     }
 
@@ -591,14 +599,17 @@ app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
 
     const number = available.rows[0];
     providerNumberId = number.telnyx_phone_number_id;
-    await updatePhoneNumberConnection(providerNumberId, sipAccount.connectionId);
-    providerAttached = true;
+    if (connectionId) {
+      await updatePhoneNumberConnection(providerNumberId, connectionId);
+      providerAttached = true;
+    }
     const updated = await client.query(
       `UPDATE phone_numbers
        SET user_id = $1, number_type = 'FREE_ASSIGNED', telnyx_connection_id = $2
       WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'FREE_POOL'
-       RETURNING id, country, city, dialing_code, phone_number, flag, number_type, active`,
-      [req.user.id, sipAccount.connectionId, number.id]
+       RETURNING id, country, city, dialing_code, phone_number, flag, number_type,
+                 active, telnyx_connection_id`,
+      [req.user.id, connectionId, number.id]
     );
     if (updated.rowCount === 0) throw new Error("The free number could not be assigned.");
     await client.query("COMMIT");
@@ -612,7 +623,8 @@ app.post("/api/numbers/claim-free", authenticate, async (req, res, next) => {
       number: row.phone_number,
       flag: row.flag,
       label: row.number_type,
-      active: row.active
+      active: row.active,
+      mode: row.telnyx_connection_id ? "VOICE_AND_SMS" : "SMS_ONLY"
     } });
   } catch (error) {
     if (transactionStarted) await client.query("ROLLBACK");
