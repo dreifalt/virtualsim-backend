@@ -35,6 +35,7 @@ After adding these values in Render (or another host), redeploy the backend and 
 - `GET /api/profile` — return the caller's profile, wallet credits, and VIP availability.
 - `GET /api/numbers` — return only numbers assigned to the caller.
 - `GET /api/numbers/vip` — list currently available VIP numbers for selection.
+- `POST /api/numbers/unlock-vip` — atomically spend 50 wallet credits and assign the selected VIP number.
 - `POST /api/numbers/claim-free` — claim one free number; repeats return the user's existing free assignment.
 - `GET /api/messages` — return only the caller's SMS messages from the last 24 hours.
 - `GET /api/voip-config` — automatically provision or return the caller's Telnyx SIP account; requires bearer auth and uses `Cache-Control: no-store`.

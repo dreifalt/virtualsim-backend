@@ -43,6 +43,7 @@ const TELNYX_VIP_TAG = process.env.TELNYX_VIP_TAG || "vip";
 const TELNYX_SYNC_INTERVAL_MS = Number(process.env.TELNYX_SYNC_INTERVAL_MS || 15 * 60 * 1000);
 const PLAY_PACKAGE_NAME = process.env.PLAY_PACKAGE_NAME || "com.virtualsim.pro";
 const VIP_PRODUCT_ID = process.env.VIP_PRODUCT_ID || "virtualsim_vip_number";
+const VIP_CREDIT_COST = 50;
 const REWARD_CREDITS = Number(process.env.AD_REWARD_CREDITS || 1);
 const DATA_KEY = process.env.DATA_ENCRYPTION_KEY
   ? Buffer.from(process.env.DATA_ENCRYPTION_KEY, "base64")
@@ -700,6 +701,103 @@ app.get("/api/numbers/vip", authenticate, async (_req, res, next) => {
     });
   } catch (error) {
     return next(error);
+  }
+});
+
+app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
+  const numberId = String(req.body?.numberId || "").trim();
+  if (!numberId) return res.status(400).json({ error: "Select an available VIP number." });
+
+  let sipAccount;
+  try {
+    const user = await pool.query("SELECT credits FROM users WHERE id = $1", [req.user.id]);
+    if (user.rowCount === 0) return res.status(404).json({ error: "User not found." });
+    if (user.rows[0].credits < VIP_CREDIT_COST) {
+      return res.status(402).json({ error: "You need 50 credits to unlock a VIP number." });
+    }
+    const number = await pool.query(
+      `SELECT 1 FROM phone_numbers
+       WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL`,
+      [numberId]
+    );
+    if (number.rowCount === 0) {
+      return res.status(409).json({ error: "The selected VIP number is no longer available." });
+    }
+    sipAccount = await ensureTelnyxSipAccount(req.user.id);
+  } catch (error) {
+    return next(error);
+  }
+
+  const client = await pool.connect();
+  let transactionStarted = false;
+  let attachedNumberId = null;
+  let committed = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const user = await client.query(
+      "SELECT credits FROM users WHERE id = $1 FOR UPDATE",
+      [req.user.id]
+    );
+    if (user.rowCount === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "User not found." });
+    }
+    if (user.rows[0].credits < VIP_CREDIT_COST) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(402).json({ error: "You need 50 credits to unlock a VIP number." });
+    }
+
+    const number = await client.query(
+      `SELECT id, telnyx_phone_number_id FROM phone_numbers
+       WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL
+       FOR UPDATE SKIP LOCKED`,
+      [numberId]
+    );
+    if (number.rowCount === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({ error: "The selected VIP number is no longer available." });
+    }
+
+    attachedNumberId = number.rows[0].telnyx_phone_number_id;
+    await updatePhoneNumberConnection(attachedNumberId, sipAccount.connectionId);
+    const assigned = await client.query(
+      `UPDATE phone_numbers
+       SET user_id = $1, telnyx_connection_id = $2
+       WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+       RETURNING id`,
+      [req.user.id, sipAccount.connectionId, numberId]
+    );
+    if (assigned.rowCount === 0) throw new Error("The VIP number could not be assigned.");
+
+    const debit = await client.query(
+      "UPDATE users SET credits = credits - $1 WHERE id = $2 AND credits >= $1 RETURNING credits",
+      [VIP_CREDIT_COST, req.user.id]
+    );
+    if (debit.rowCount === 0) throw new Error("The VIP credit balance changed before assignment.");
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+    committed = true;
+    attachedNumberId = null;
+    return res.json({ unlocked: true, numberId, credits: debit.rows[0].credits });
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK");
+    if (attachedNumberId && !committed) {
+      try {
+        await updatePhoneNumberConnection(attachedNumberId, null);
+      } catch (cleanupError) {
+        console.error(`Unable to detach an unassigned VIP Telnyx number: ${cleanupError.message}`);
+      }
+    }
+    return next(error);
+  } finally {
+    client.release();
   }
 });
 

@@ -69,6 +69,13 @@ test("Telnyx inventory uses the VIP tag and maps supported countries", () => {
   assert.equal(number.country, "Sweden");
   assert.equal(number.numberType, "VIP_PRIVATE");
   assert.equal(inventoryRecord({
+    id: "uppercase-vip",
+    phone_number: "+46701234568",
+    country_iso_alpha2: "SE",
+    status: "active",
+    tags: ["VIP"]
+  }).numberType, "VIP_PRIVATE");
+  assert.equal(inventoryRecord({
     id: "free-id",
     phone_number: "+12125550148",
     country_iso_alpha2: "US",
