@@ -4,9 +4,11 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const test = require("node:test");
 const {
+  createPhoneOtp,
   decryptText,
   encryptText,
   extractOtp,
+  hashPhoneOtp,
   normalizePhoneNumber,
   verifyAdMobSignature,
   verifyTelnyxSignature
@@ -21,6 +23,14 @@ test("phone number normalization accepts E.164 and rejects local numbers", () =>
 test("OTP extraction returns only a bounded standalone code", () => {
   assert.equal(extractOtp("Your code is 482901."), "482901");
   assert.equal(extractOtp("Tracking number 123456789"), "");
+});
+
+test("phone sign-in OTPs are six digits and stored as keyed digests", () => {
+  const key = Buffer.alloc(32, 7);
+  const code = createPhoneOtp();
+  assert.match(code, /^\d{6}$/);
+  assert.equal(hashPhoneOtp("+15551234567", code, key), hashPhoneOtp("+15551234567", code, key));
+  assert.notEqual(hashPhoneOtp("+15551234567", code, key), hashPhoneOtp("+15551234567", "000000", key));
 });
 
 test("encrypted values round trip and authenticate their ciphertext", () => {

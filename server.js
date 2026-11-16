@@ -11,9 +11,11 @@ const { rateLimit } = require("express-rate-limit");
 const { Pool } = require("pg");
 const { google } = require("googleapis");
 const {
+  createPhoneOtp,
   decryptText,
   encryptText,
   extractOtp,
+  hashPhoneOtp,
   normalizePhoneNumber,
   safeEqual,
   verifyAdMobSignature,
@@ -27,6 +29,7 @@ const {
   isSipProvisioningConfigured,
   listPurchasedNumbers,
   parseInboundSms,
+  sendSms,
   updatePhoneNumberConnection
 } = require("./telnyx");
 
@@ -72,6 +75,18 @@ const authLimiter = rateLimit({
   standardHeaders: "draft-8",
   legacyHeaders: false
 });
+const phoneOtpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  standardHeaders: "draft-8",
+  legacyHeaders: false
+});
+const phoneOtpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false
+});
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 60,
@@ -92,12 +107,27 @@ app.use(express.urlencoded({ extended: false, limit: "32kb" }));
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
   id text PRIMARY KEY,
-  email text NOT NULL UNIQUE,
-  password_hash text NOT NULL,
+  email text UNIQUE,
+  password_hash text,
+  phone_number text,
+  phone_verified_at timestamptz,
   credits integer NOT NULL DEFAULT 0 CHECK (credits >= 0),
   token_version integer NOT NULL DEFAULT 0,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT users_identity_check CHECK (email IS NOT NULL OR phone_number IS NOT NULL)
 );
+ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_at timestamptz;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_identity_check') THEN
+    ALTER TABLE users
+      ADD CONSTRAINT users_identity_check CHECK (email IS NOT NULL OR phone_number IS NOT NULL);
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS users_phone_number_idx ON users(phone_number);
 CREATE TABLE IF NOT EXISTS phone_numbers (
   id text PRIMARY KEY,
   user_id text REFERENCES users(id) ON DELETE SET NULL,
@@ -111,6 +141,13 @@ CREATE TABLE IF NOT EXISTS phone_numbers (
   telnyx_connection_id text,
   active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS phone_auth_challenges (
+  phone_number text PRIMARY KEY,
+  code_hash text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0,
+  sent_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS telnyx_phone_number_id text;
 ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS telnyx_connection_id text;
@@ -206,7 +243,7 @@ async function authenticate(req, res, next) {
   try {
     const claims = jwt.verify(match[1], JWT_SECRET, { issuer: "virtualsim-master" });
     const result = await pool.query(
-      "SELECT id, email, credits, token_version FROM users WHERE id = $1",
+      "SELECT id, email, phone_number, credits, token_version FROM users WHERE id = $1",
       [claims.sub]
     );
     const user = result.rows[0];
@@ -416,12 +453,139 @@ app.get("/health", async (_req, res, next) => {
       telnyx: {
         configured: Boolean(TELNYX_API_KEY),
         webhookConfigured: Boolean(TELNYX_PUBLIC_KEY),
+        messagingProfileConfigured: Boolean(String(process.env.TELNYX_MESSAGING_PROFILE_ID || "").trim()),
         outboundVoiceProfileConfigured: Boolean(String(process.env.TELNYX_OUTBOUND_VOICE_PROFILE_ID || "").trim()),
         lastInventorySync: telnyxSyncStatus.lastSuccessAt
       }
     });
   } catch (error) {
     next(error);
+  }
+});
+
+app.post("/api/auth/phone/request", phoneOtpRequestLimiter, async (req, res, next) => {
+  let phoneNumber;
+  try {
+    phoneNumber = normalizePhoneNumber(req.body?.phoneNumber);
+  } catch (error) {
+    if (error instanceof TypeError) return res.status(400).json({ error: error.message });
+    return next(error);
+  }
+
+  const code = createPhoneOtp();
+  const codeHash = hashPhoneOtp(phoneNumber, code, DATA_KEY);
+  try {
+    const challenge = await pool.query(
+      `INSERT INTO phone_auth_challenges (phone_number, code_hash, expires_at, attempts, sent_at)
+       VALUES ($1, $2, now() + interval '10 minutes', 0, now())
+       ON CONFLICT (phone_number) DO UPDATE SET
+         code_hash = EXCLUDED.code_hash,
+         expires_at = EXCLUDED.expires_at,
+         attempts = 0,
+         sent_at = now()
+       WHERE phone_auth_challenges.sent_at <= now() - interval '60 seconds'
+       RETURNING phone_number`,
+      [phoneNumber, codeHash]
+    );
+    if (challenge.rowCount === 0) {
+      return res.status(429).json({ error: "Please wait before requesting another code." });
+    }
+
+    try {
+      await sendSms({
+        to: phoneNumber,
+        text: `Your VirtualSIM Pro sign-in code is ${code}. It expires in 10 minutes.`
+      });
+    } catch (error) {
+      try {
+        await pool.query(
+          "DELETE FROM phone_auth_challenges WHERE phone_number = $1 AND code_hash = $2",
+          [phoneNumber, codeHash]
+        );
+      } catch (cleanupError) {
+        console.error(`Unable to remove an unsent phone sign-in challenge: ${cleanupError.message}`);
+      }
+      return next(error);
+    }
+    return res.json({ sent: true, expiresInSeconds: 600 });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/auth/phone/verify", phoneOtpVerifyLimiter, async (req, res, next) => {
+  let phoneNumber;
+  try {
+    phoneNumber = normalizePhoneNumber(req.body?.phoneNumber);
+  } catch (error) {
+    if (error instanceof TypeError) return res.status(400).json({ error: error.message });
+    return next(error);
+  }
+  const code = String(req.body?.code || "").trim();
+  if (!/^\d{6}$/.test(code)) {
+    return res.status(400).json({ error: "Enter the 6-digit verification code." });
+  }
+
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const challenge = await client.query(
+      `SELECT code_hash, expires_at, attempts
+       FROM phone_auth_challenges
+       WHERE phone_number = $1
+       FOR UPDATE`,
+      [phoneNumber]
+    );
+    if (challenge.rowCount === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(401).json({ error: "The verification code is invalid or expired." });
+    }
+
+    const row = challenge.rows[0];
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      await client.query("DELETE FROM phone_auth_challenges WHERE phone_number = $1", [phoneNumber]);
+      await client.query("COMMIT");
+      transactionStarted = false;
+      return res.status(401).json({ error: "The verification code is invalid or expired." });
+    }
+
+    if (Number(row.attempts) >= 5) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(401).json({ error: "The verification code is invalid or expired." });
+    }
+
+    if (!safeEqual(hashPhoneOtp(phoneNumber, code, DATA_KEY), row.code_hash)) {
+      const attempts = Number(row.attempts) + 1;
+      await client.query(
+        "UPDATE phone_auth_challenges SET attempts = $2 WHERE phone_number = $1",
+        [phoneNumber, attempts]
+      );
+      await client.query("COMMIT");
+      transactionStarted = false;
+      return res.status(401).json({ error: "The verification code is invalid or expired." });
+    }
+
+    await client.query("DELETE FROM phone_auth_challenges WHERE phone_number = $1", [phoneNumber]);
+    const result = await client.query(
+      `INSERT INTO users (id, email, password_hash, phone_number, phone_verified_at)
+       VALUES ($1, NULL, NULL, $2, now())
+       ON CONFLICT (phone_number) DO UPDATE SET phone_verified_at = now()
+       RETURNING id, email, phone_number, credits, token_version`,
+      [crypto.randomUUID(), phoneNumber]
+    );
+    await client.query("COMMIT");
+    transactionStarted = false;
+    const user = result.rows[0];
+    return res.json({ token: createToken(user), profile: publicProfile(user) });
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK");
+    return next(error);
+  } finally {
+    client.release();
   }
 });
 
@@ -435,7 +599,7 @@ app.post("/api/auth/register", authLimiter, async (req, res, next) => {
     const id = crypto.randomUUID();
     const passwordHash = await bcrypt.hash(password, 12);
     const result = await pool.query(
-      "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) RETURNING id, email, credits, token_version",
+      "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) RETURNING id, email, phone_number, credits, token_version",
       [id, email, passwordHash]
     );
     const user = result.rows[0];
@@ -451,7 +615,7 @@ app.post("/api/auth/login", authLimiter, async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body.email);
     const result = await pool.query(
-      "SELECT id, email, password_hash, credits, token_version FROM users WHERE email = $1",
+      "SELECT id, email, phone_number, password_hash, credits, token_version FROM users WHERE email = $1",
       [email]
     );
     const user = result.rows[0];
@@ -467,7 +631,7 @@ app.post("/api/auth/login", authLimiter, async (req, res, next) => {
 function publicProfile(user, vipAvailable = false) {
   return {
     id: user.id,
-    email: user.email,
+    email: user.email || user.phone_number,
     credits: user.credits,
     vipAvailable
   };
@@ -508,6 +672,30 @@ app.get("/api/numbers", authenticate, async (req, res, next) => {
         flag: row.flag,
         label: row.number_type,
         active: row.active
+      }))
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/numbers/vip", authenticate, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, country, city, dialing_code, phone_number, flag
+       FROM phone_numbers
+       WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL
+       ORDER BY country, city, phone_number`
+    );
+    return res.json({
+      numbers: result.rows.map((row) => ({
+        id: row.id,
+        country: row.country,
+        city: row.city,
+        dialingCode: row.dialing_code,
+        number: row.phone_number,
+        flag: row.flag
       }))
     });
   } catch (error) {
@@ -878,6 +1066,7 @@ app.get("/api/webhooks/admob", async (req, res, next) => {
 app.post("/api/store/verify-vip", authenticate, async (req, res, next) => {
   const purchaseToken = String(req.body.purchaseToken || "");
   const productId = String(req.body.productId || "");
+  const requestedNumberId = String(req.body.numberId || "").trim() || null;
   if (!purchaseToken || productId !== VIP_PRODUCT_ID) {
     return res.status(400).json({ error: "Invalid VIP purchase." });
   }
@@ -923,12 +1112,18 @@ app.post("/api/store/verify-vip", authenticate, async (req, res, next) => {
         `SELECT id, telnyx_phone_number_id FROM phone_numbers
          WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
            AND telnyx_phone_number_id IS NOT NULL
+           AND ($1::text IS NULL OR id = $1)
          ORDER BY created_at LIMIT 1
-         FOR UPDATE SKIP LOCKED`
+         FOR UPDATE SKIP LOCKED`,
+        [requestedNumberId]
       );
       if (number.rowCount === 0) {
         await client.query("ROLLBACK");
-        return res.status(409).json({ error: "No VIP numbers are currently available." });
+        return res.status(409).json({
+          error: requestedNumberId
+            ? "The selected VIP number is no longer available."
+            : "No VIP numbers are currently available."
+        });
       }
       const numberId = number.rows[0].id;
       const sipAccount = await ensureTelnyxSipAccount(req.user.id);
@@ -1054,11 +1249,13 @@ async function start() {
   await pool.query(schema);
   await pool.query("DELETE FROM sms_messages WHERE created_at < now() - interval '24 hours'");
   await pool.query("DELETE FROM webhook_nonces WHERE received_at < now() - interval '24 hours'");
+  await pool.query("DELETE FROM phone_auth_challenges WHERE expires_at < now()");
   await pool.query("DELETE FROM ad_reward_tokens WHERE expires_at < now() OR used_at < now() - interval '24 hours'");
   const cleanup = setInterval(async () => {
     try {
       await pool.query("DELETE FROM sms_messages WHERE created_at < now() - interval '24 hours'");
       await pool.query("DELETE FROM webhook_nonces WHERE received_at < now() - interval '24 hours'");
+      await pool.query("DELETE FROM phone_auth_challenges WHERE expires_at < now()");
       await pool.query("DELETE FROM ad_reward_tokens WHERE expires_at < now() OR used_at < now() - interval '24 hours'");
     } catch (error) {
       console.error(`Cleanup failed: ${error.message}`);

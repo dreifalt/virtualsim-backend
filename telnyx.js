@@ -178,6 +178,21 @@ async function createCredentialConnection({ username, password, userId }) {
   return String(response.data.id);
 }
 
+async function sendSms({ to, text }) {
+  const messagingProfileId = String(process.env.TELNYX_MESSAGING_PROFILE_ID || "").trim();
+  if (!messagingProfileId) {
+    throw new TelnyxApiError(503, "Telnyx messaging is not configured.");
+  }
+  return telnyxRequest("/messages", {
+    method: "POST",
+    body: {
+      to,
+      messaging_profile_id: messagingProfileId,
+      text
+    }
+  });
+}
+
 function isSipProvisioningConfigured() {
   return Boolean(
     String(process.env.TELNYX_API_KEY || "").trim() &&
@@ -217,6 +232,7 @@ module.exports = {
   isSipProvisioningConfigured,
   listPurchasedNumbers,
   parseInboundSms,
+  sendSms,
   telnyxRequest,
   updatePhoneNumberConnection
 };

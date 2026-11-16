@@ -21,6 +21,16 @@ function extractOtp(message) {
   return String(message || "").match(/(?<!\d)\d{4,8}(?!\d)/)?.[0] || "";
 }
 
+function createPhoneOtp() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function hashPhoneOtp(phoneNumber, code, key) {
+  return crypto.createHmac("sha256", key)
+    .update(`${phoneNumber}:${code}`, "utf8")
+    .digest("hex");
+}
+
 function encryptText(value, key) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
@@ -127,7 +137,9 @@ function verifyAdMobSignature(rawQuery, key) {
 module.exports = {
   decryptText,
   encryptText,
+  createPhoneOtp,
   extractOtp,
+  hashPhoneOtp,
   normalizePhoneNumber,
   safeEqual,
   verifyAdMobSignature,

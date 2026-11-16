@@ -6,6 +6,7 @@ const {
   createCredentialConnection,
   deleteCredentialConnection,
   isSipProvisioningConfigured,
+  sendSms,
   telnyxRequest,
   updatePhoneNumberConnection
 } = require("./telnyx");
@@ -92,7 +93,6 @@ test("Telnyx cleanup treats already-removed resources as idempotent", async () =
     status: 404,
     headers: { "content-type": "application/json" }
   });
-
   try {
     await deleteCredentialConnection("missing-connection");
     await updatePhoneNumberConnection("missing-number", null);
@@ -104,5 +104,36 @@ test("Telnyx cleanup treats already-removed resources as idempotent", async () =
     global.fetch = originalFetch;
     if (originalApiKey === undefined) delete process.env.TELNYX_API_KEY;
     else process.env.TELNYX_API_KEY = originalApiKey;
+  }
+});
+
+test("Telnyx sends app sign-in SMS through the configured messaging profile", async () => {
+  const originalFetch = global.fetch;
+  const originalApiKey = process.env.TELNYX_API_KEY;
+  const originalMessagingProfileId = process.env.TELNYX_MESSAGING_PROFILE_ID;
+  process.env.TELNYX_API_KEY = "test-api-key";
+  process.env.TELNYX_MESSAGING_PROFILE_ID = "messaging-profile-id";
+  let requestBody;
+  global.fetch = async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({ data: { id: "message-id" } }), {
+      status: 202,
+      headers: { "content-type": "application/json" }
+    });
+  };
+
+  try {
+    await sendSms({ to: "+15551234567", text: "Your sign-in code is 123456." });
+    assert.deepEqual(requestBody, {
+      to: "+15551234567",
+      messaging_profile_id: "messaging-profile-id",
+      text: "Your sign-in code is 123456."
+    });
+  } finally {
+    global.fetch = originalFetch;
+    if (originalApiKey === undefined) delete process.env.TELNYX_API_KEY;
+    else process.env.TELNYX_API_KEY = originalApiKey;
+    if (originalMessagingProfileId === undefined) delete process.env.TELNYX_MESSAGING_PROFILE_ID;
+    else process.env.TELNYX_MESSAGING_PROFILE_ID = originalMessagingProfileId;
   }
 });
