@@ -269,6 +269,71 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+app.post("/admin/reset-users", adminLimiter, requireAdmin, async (req, res, next) => {
+  if (!req.body || req.body.confirm !== true) {
+    return res.status(400).json({ error: "Set confirm to true to reset all users and number assignments." });
+  }
+
+  let client;
+  let transactionStarted = false;
+  try {
+    const [numbers, sipAccounts] = await Promise.all([
+      pool.query(
+        `SELECT telnyx_phone_number_id, telnyx_connection_id
+         FROM phone_numbers
+         WHERE user_id IS NOT NULL OR number_type = 'FREE_ASSIGNED'`
+      ),
+      pool.query("SELECT telnyx_connection_id FROM sip_accounts WHERE telnyx_connection_id IS NOT NULL")
+    ]);
+    const assignedCarrierNumbers = numbers.rows.filter(
+      (number) => number.telnyx_phone_number_id && number.telnyx_connection_id
+    );
+    const connectionIds = new Set(
+      [
+        ...sipAccounts.rows.map((account) => account.telnyx_connection_id),
+        ...numbers.rows.map((number) => number.telnyx_connection_id)
+      ].filter(Boolean)
+    );
+    if ((assignedCarrierNumbers.length || connectionIds.size) && !TELNYX_API_KEY) {
+      throw new TelnyxApiError(503, "Telnyx is unavailable for account cleanup. Please retry later.");
+    }
+
+    for (const number of assignedCarrierNumbers) {
+      await updatePhoneNumberConnection(number.telnyx_phone_number_id, null);
+    }
+    for (const connectionId of connectionIds) {
+      await deleteCredentialConnection(connectionId);
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const resetNumbers = await client.query(
+      `UPDATE phone_numbers
+       SET user_id = NULL,
+           number_type = CASE WHEN number_type = 'FREE_ASSIGNED' THEN 'FREE_POOL' ELSE number_type END,
+           active = CASE WHEN number_type = 'FREE_ASSIGNED' THEN true ELSE active END,
+           telnyx_connection_id = NULL
+       WHERE user_id IS NOT NULL OR number_type = 'FREE_ASSIGNED'
+       RETURNING id`
+    );
+    const deletedUsers = await client.query("DELETE FROM users RETURNING id");
+    const deletedChallenges = await client.query("DELETE FROM phone_auth_challenges");
+    await client.query("COMMIT");
+    transactionStarted = false;
+    return res.json({
+      usersDeleted: deletedUsers.rowCount,
+      numbersReset: resetNumbers.rowCount,
+      phoneAuthChallengesDeleted: deletedChallenges.rowCount
+    });
+  } catch (error) {
+    if (client && transactionStarted) await client.query("ROLLBACK");
+    return next(error);
+  } finally {
+    if (client) client.release();
+  }
+});
+
 function normalizeEmail(value) {
   const email = String(value || "").trim().toLowerCase();
   if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
