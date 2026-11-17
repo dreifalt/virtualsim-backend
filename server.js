@@ -30,6 +30,7 @@ const {
   listPurchasedNumbers,
   parseInboundSms,
   sendSms,
+  telnyxRequest,
   updatePhoneNumberConnection
 } = require("./telnyx");
 
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS phone_numbers (
   number_type text NOT NULL CHECK (number_type IN ('FREE_POOL', 'FREE_ASSIGNED', 'VIP_PRIVATE')),
   telnyx_phone_number_id text,
   telnyx_connection_id text,
+  vip_expires_at timestamptz,
   active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -164,6 +166,7 @@ CREATE TABLE IF NOT EXISTS phone_auth_challenges (
 );
 ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS telnyx_phone_number_id text;
 ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS telnyx_connection_id text;
+ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS vip_expires_at timestamptz;
 DO $$
 BEGIN
   IF EXISTS (
@@ -236,9 +239,22 @@ CREATE TABLE IF NOT EXISTS vip_purchases (
   purchase_token_hash text PRIMARY KEY,
   user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   product_id text NOT NULL,
-  number_id text NOT NULL UNIQUE REFERENCES phone_numbers(id) ON DELETE CASCADE,
+  number_id text UNIQUE REFERENCES phone_numbers(id) ON DELETE CASCADE,
+  status text NOT NULL DEFAULT 'active',
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE vip_purchases ALTER COLUMN number_id DROP NOT NULL;
+ALTER TABLE vip_purchases ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'vip_purchases_status_check'
+  ) THEN
+    ALTER TABLE vip_purchases
+      ADD CONSTRAINT vip_purchases_status_check
+      CHECK (status IN ('active', 'pending_provision'));
+  END IF;
+END $$;
 `;
 
 function createToken(user) {
@@ -450,6 +466,224 @@ async function ensureTelnyxSipAccount(userId) {
       }
     }
     throw error;
+  }
+}
+
+function vipNumberResponse(row) {
+  return {
+    id: row.id,
+    phoneNumber: row.phone_number,
+    country: row.country,
+    city: row.city,
+    dialingCode: row.dialing_code,
+    flag: row.flag,
+    validUntil: row.vip_expires_at
+  };
+}
+
+async function orderTelnyxVipNumber() {
+  const connectionId = String(process.env.TELNYX_CONNECTION_ID || "").trim();
+  const messagingProfileId = String(process.env.TELNYX_MESSAGING_PROFILE_ID || "").trim();
+  if (!connectionId || !messagingProfileId) {
+    throw new TelnyxApiError(503, "Telnyx number ordering is not configured.");
+  }
+
+  const query = new URLSearchParams();
+  query.set("filter[country_code]", "US");
+  query.append("filter[features][]", "sms");
+  query.append("filter[features][]", "voice");
+  query.set("filter[limit]", "1");
+  const available = await telnyxRequest(`/available_phone_numbers?${query}`);
+  const candidate = available && Array.isArray(available.data) && available.data[0];
+  if (!candidate || !candidate.phone_number) {
+    throw new TelnyxApiError(404, "Telnyx has no available US number with SMS and voice.");
+  }
+
+  const order = await telnyxRequest("/number_orders", {
+    method: "POST",
+    body: {
+      phone_numbers: [{ phone_number: candidate.phone_number }],
+      connection_id: connectionId,
+      messaging_profile_id: messagingProfileId
+    }
+  });
+  const orderNumbers = order && order.data && order.data.phone_numbers;
+  const orderedNumber = Array.isArray(orderNumbers)
+    ? orderNumbers.find((number) => number.phone_number === candidate.phone_number) || orderNumbers[0]
+    : null;
+  const telnyxPhoneNumberId = orderedNumber && (orderedNumber.id || orderedNumber.phone_number_id);
+  if (!orderedNumber || !orderedNumber.phone_number || !telnyxPhoneNumberId) {
+    throw new TelnyxApiError(502, "Telnyx did not return the ordered phone number.");
+  }
+
+  return {
+    phoneNumber: normalizePhoneNumber(orderedNumber.phone_number),
+    telnyxPhoneNumberId: String(telnyxPhoneNumberId),
+    country: "United States",
+    city: String(candidate.locality || candidate.city || "").slice(0, 80),
+    dialingCode: "+1",
+    flag: "🇺🇸"
+  };
+}
+
+async function fulfillVipPurchase({ tokenHash, userId, productId, requestedNumberId = null }) {
+  const client = await pool.connect();
+  let transactionStarted = false;
+  let attachedNumberId = null;
+  let newlyOrderedNumber = null;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const purchase = await client.query(
+      `SELECT user_id, product_id, number_id, status
+       FROM vip_purchases WHERE purchase_token_hash = $1 FOR UPDATE`,
+      [tokenHash]
+    );
+    if (purchase.rowCount === 0) throw new Error("The verified VIP purchase could not be saved.");
+    if (purchase.rows[0].user_id !== userId || purchase.rows[0].product_id !== productId) {
+      throw new TelnyxApiError(409, "This Play purchase has already been applied to another account.");
+    }
+
+    if (purchase.rows[0].status === "active" && purchase.rows[0].number_id) {
+      const active = await client.query(
+        `SELECT id, phone_number, country, city, dialing_code, flag, vip_expires_at, active
+         FROM phone_numbers WHERE id = $1 AND user_id = $2`,
+        [purchase.rows[0].number_id, userId]
+      );
+      if (active.rowCount > 0) {
+        if (!active.rows[0].active ||
+            (active.rows[0].vip_expires_at && new Date(active.rows[0].vip_expires_at).getTime() <= Date.now())) {
+          await client.query("COMMIT");
+          transactionStarted = false;
+          return { status: "expired" };
+        }
+        await client.query("COMMIT");
+        transactionStarted = false;
+        const sipAccount = await ensureTelnyxSipAccount(userId);
+        return { status: "active", number: vipNumberResponse(active.rows[0]), sipConfig: sipAccount };
+      }
+    }
+
+    const available = await client.query(
+      `SELECT id, phone_number, country, city, dialing_code, flag, telnyx_phone_number_id
+       FROM phone_numbers
+       WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
+       ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END, created_at
+       LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      [requestedNumberId]
+    );
+    let number = available.rows[0] || null;
+    const shouldProvision = process.env.AUTO_PROVISION_TELNYX === "true";
+    if (!number && !shouldProvision) {
+      await client.query("COMMIT");
+      transactionStarted = false;
+      return { status: "pending_provision" };
+    }
+
+    const sipAccount = await ensureTelnyxSipAccount(userId);
+    if (!number) {
+      newlyOrderedNumber = await orderTelnyxVipNumber();
+      attachedNumberId = newlyOrderedNumber.telnyxPhoneNumberId;
+      await updatePhoneNumberConnection(attachedNumberId, sipAccount.connectionId);
+      const inserted = await client.query(
+        `INSERT INTO phone_numbers
+         (id, user_id, phone_number, country, city, dialing_code, flag, number_type,
+          telnyx_phone_number_id, telnyx_connection_id, vip_expires_at, active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'VIP_PRIVATE', $8, $9,
+                 now() + interval '30 days', true)
+         ON CONFLICT (phone_number) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           country = EXCLUDED.country,
+           city = EXCLUDED.city,
+           dialing_code = EXCLUDED.dialing_code,
+           flag = EXCLUDED.flag,
+           number_type = 'VIP_PRIVATE',
+           telnyx_phone_number_id = EXCLUDED.telnyx_phone_number_id,
+           telnyx_connection_id = EXCLUDED.telnyx_connection_id,
+           vip_expires_at = EXCLUDED.vip_expires_at,
+           active = true
+         WHERE phone_numbers.user_id IS NULL
+         RETURNING id, phone_number, country, city, dialing_code, flag, vip_expires_at`,
+        [
+          crypto.randomUUID(),
+          userId,
+          newlyOrderedNumber.phoneNumber,
+          newlyOrderedNumber.country,
+          newlyOrderedNumber.city,
+          newlyOrderedNumber.dialingCode,
+          newlyOrderedNumber.flag,
+          newlyOrderedNumber.telnyxPhoneNumberId,
+          sipAccount.connectionId
+        ]
+      );
+      if (inserted.rowCount === 0) throw new Error("The ordered VIP number is already assigned.");
+      number = inserted.rows[0];
+    } else {
+      attachedNumberId = number.telnyx_phone_number_id;
+      await updatePhoneNumberConnection(attachedNumberId, sipAccount.connectionId);
+      const assigned = await client.query(
+        `UPDATE phone_numbers
+         SET user_id = $1, telnyx_connection_id = $2,
+             vip_expires_at = now() + interval '30 days'
+         WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         RETURNING id, phone_number, country, city, dialing_code, flag, vip_expires_at`,
+        [userId, sipAccount.connectionId, number.id]
+      );
+      if (assigned.rowCount === 0) throw new Error("The VIP number could not be assigned.");
+      number = assigned.rows[0];
+    }
+
+    await client.query(
+      `UPDATE vip_purchases
+       SET number_id = $1, status = 'active'
+       WHERE purchase_token_hash = $2`,
+      [number.id, tokenHash]
+    );
+    await client.query("COMMIT");
+    transactionStarted = false;
+    attachedNumberId = null;
+    newlyOrderedNumber = null;
+    return { status: "active", number: vipNumberResponse(number), sipConfig: sipAccount };
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK");
+    if (newlyOrderedNumber) {
+      try {
+        await updatePhoneNumberConnection(newlyOrderedNumber.telnyxPhoneNumberId, null);
+      } catch (cleanupError) {
+        console.error(`Unable to detach an unassigned ordered VIP number: ${cleanupError.message}`);
+      }
+      try {
+        await pool.query(
+          `INSERT INTO phone_numbers
+           (id, phone_number, country, city, dialing_code, flag, number_type,
+            telnyx_phone_number_id, active)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'VIP_PRIVATE', $8, true)
+           ON CONFLICT (phone_number) DO NOTHING`,
+          [
+            crypto.randomUUID(),
+            newlyOrderedNumber.phoneNumber,
+            newlyOrderedNumber.country,
+            newlyOrderedNumber.city,
+            newlyOrderedNumber.dialingCode,
+            newlyOrderedNumber.flag,
+            newlyOrderedNumber.telnyxPhoneNumberId
+          ]
+        );
+      } catch (saveError) {
+        console.error(`Unable to save the ordered VIP number for retry: ${saveError.message}`);
+      }
+    } else if (attachedNumberId) {
+      try {
+        await updatePhoneNumberConnection(attachedNumberId, null);
+      } catch (cleanupError) {
+        console.error(`Unable to detach an unassigned VIP Telnyx number: ${cleanupError.message}`);
+      }
+    }
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -724,6 +958,7 @@ async function userHasActiveVipNumber(userId) {
     `SELECT EXISTS (
        SELECT 1 FROM phone_numbers
        WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE'
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
      ) AS has_vip`,
     [userId]
   );
@@ -743,8 +978,8 @@ function publicProfile(user, vipAvailable = false, hasVipNumber = false) {
 app.get("/api/profile", authenticate, async (req, res, next) => {
   try {
     const [available, vip] = await Promise.all([
-      pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE' AND telnyx_phone_number_id IS NOT NULL) AS available"),
-      pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE') AS has_vip", [req.user.id])
+      pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE' AND telnyx_phone_number_id IS NOT NULL AND (vip_expires_at IS NULL OR vip_expires_at > now())) AS available"),
+      pool.query("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE' AND (vip_expires_at IS NULL OR vip_expires_at > now())) AS has_vip", [req.user.id])
     ]);
     return res.json({
       profile: publicProfile(
@@ -771,7 +1006,8 @@ app.get("/api/numbers", authenticate, async (req, res, next) => {
        WHERE active = true
          AND (
            number_type IN ('FREE_POOL', 'FREE_ASSIGNED')
-           OR (number_type = 'VIP_PRIVATE' AND user_id = $1)
+           OR (number_type = 'VIP_PRIVATE' AND user_id = $1
+               AND (vip_expires_at IS NULL OR vip_expires_at > now()))
          )
        ORDER BY CASE number_type
          WHEN 'FREE_POOL' THEN 0
@@ -805,6 +1041,7 @@ app.get("/api/numbers/vip", authenticate, async (_req, res, next) => {
        FROM phone_numbers
        WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
          AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
        ORDER BY country, city, phone_number`
     );
     return res.json({
@@ -836,7 +1073,8 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
     const number = await pool.query(
       `SELECT 1 FROM phone_numbers
        WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-         AND telnyx_phone_number_id IS NOT NULL`,
+         AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())`,
       [numberId]
     );
     if (number.rowCount === 0) {
@@ -875,6 +1113,7 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
       `SELECT id, telnyx_phone_number_id FROM phone_numbers
        WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
          AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
        FOR UPDATE SKIP LOCKED`,
       [numberId]
     );
@@ -1002,6 +1241,7 @@ app.get("/api/voip-config", authenticate, async (req, res, next) => {
       `SELECT id, phone_number, telnyx_phone_number_id, telnyx_connection_id
        FROM phone_numbers
        WHERE user_id = $1 AND active AND number_type = 'VIP_PRIVATE'
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
        ORDER BY created_at, id
        LIMIT 1`,
       [req.user.id]
@@ -1044,6 +1284,7 @@ app.get("/api/voip-config", authenticate, async (req, res, next) => {
           `UPDATE phone_numbers
            SET telnyx_connection_id = $1
            WHERE id = $2 AND user_id = $3 AND active AND number_type = 'VIP_PRIVATE'
+             AND (vip_expires_at IS NULL OR vip_expires_at > now())
            RETURNING id`,
           [account.connectionId, number.id, req.user.id]
         );
@@ -1358,66 +1599,64 @@ app.post("/api/store/verify-vip", authenticate, async (req, res, next) => {
     }
 
     const tokenHash = crypto.createHash("sha256").update(purchaseToken).digest("hex");
-    const client = await pool.connect();
-    let attachedNumberId = null;
-    try {
-      await client.query("BEGIN");
-      const duplicate = await client.query(
-        "SELECT 1 FROM vip_purchases WHERE purchase_token_hash = $1",
+    const saved = await pool.query(
+      `INSERT INTO vip_purchases (purchase_token_hash, user_id, product_id, status)
+       VALUES ($1, $2, $3, 'pending_provision')
+       ON CONFLICT (purchase_token_hash) DO NOTHING`,
+      [tokenHash, req.user.id, productId]
+    );
+    if (saved.rowCount === 0) {
+      const existing = await pool.query(
+        "SELECT user_id, product_id FROM vip_purchases WHERE purchase_token_hash = $1",
         [tokenHash]
       );
-      if (duplicate.rowCount > 0) {
-        await client.query("COMMIT");
-        return res.json({ verified: true, alreadyApplied: true });
+      if (existing.rowCount === 0) {
+        throw new Error("The verified VIP purchase could not be saved.");
       }
-      const number = await client.query(
-        `SELECT id, telnyx_phone_number_id FROM phone_numbers
-         WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-           AND telnyx_phone_number_id IS NOT NULL
-           AND ($1::text IS NULL OR id = $1)
-         ORDER BY created_at LIMIT 1
-         FOR UPDATE SKIP LOCKED`,
-        [requestedNumberId]
-      );
-      if (number.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          error: requestedNumberId
-            ? "The selected VIP number is no longer available."
-            : "No VIP numbers are currently available."
+      if (existing.rows[0].user_id !== req.user.id || existing.rows[0].product_id !== productId) {
+        return res.status(409).json({ error: "This Play purchase has already been applied to another account." });
+      }
+    }
+
+    try {
+      const result = await fulfillVipPurchase({
+        tokenHash,
+        userId: req.user.id,
+        productId,
+        requestedNumberId
+      });
+      if (result.status === "pending_provision") {
+        return res.status(202).json({
+          verified: true,
+          status: "pending_provision",
+          message: "Your purchase is verified. Number provisioning will be retried automatically."
         });
       }
-      const numberId = number.rows[0].id;
-      const sipAccount = await ensureTelnyxSipAccount(req.user.id);
-      attachedNumberId = number.rows[0].telnyx_phone_number_id;
-      await updatePhoneNumberConnection(attachedNumberId, sipAccount.connectionId);
-      const assigned = await client.query(
-        `UPDATE phone_numbers
-         SET user_id = $1, telnyx_connection_id = $2
-         WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-         RETURNING id`,
-        [req.user.id, sipAccount.connectionId, numberId]
-      );
-      if (assigned.rowCount === 0) throw new Error("The VIP number could not be assigned.");
-      await client.query(
-        "INSERT INTO vip_purchases (purchase_token_hash, user_id, product_id, number_id) VALUES ($1, $2, $3, $4)",
-        [tokenHash, req.user.id, productId, numberId]
-      );
-      await client.query("COMMIT");
-      attachedNumberId = null;
-      return res.json({ verified: true, numberId });
-    } catch (error) {
-      await client.query("ROLLBACK");
-      if (attachedNumberId) {
-        try {
-          await updatePhoneNumberConnection(attachedNumberId, null);
-        } catch (cleanupError) {
-          console.error(`Unable to detach an unassigned VIP Telnyx number: ${cleanupError.message}`);
-        }
+      if (result.status === "expired") {
+        return res.status(410).json({
+          verified: true,
+          status: "expired",
+          message: "The 30-day validity period for this VIP purchase has ended."
+        });
       }
-      throw error;
-    } finally {
-      client.release();
+      return res.json({
+        verified: true,
+        status: "active",
+        numberId: result.number.id,
+        number: result.number,
+        sipConfig: result.sipConfig
+      });
+    } catch (error) {
+      if (!(error instanceof TelnyxApiError)) throw error;
+      console.error(
+        `Telnyx VIP provisioning failed for purchase ${tokenHash.slice(0, 12)} ` +
+        `(status ${error.status}): ${error.message}`
+      );
+      return res.status(202).json({
+        verified: true,
+        status: "pending_provision",
+        message: "Your purchase is verified. Number provisioning will be retried automatically."
+      });
     }
   } catch (error) {
     return next(error);
@@ -1458,7 +1697,7 @@ app.post("/api/webhook/sms", async (req, res, next) => {
         return res.status(200).json({ status: "duplicate" });
       }
       const number = await client.query(
-        "SELECT id, user_id FROM phone_numbers WHERE phone_number = $1 AND active AND user_id IS NOT NULL FOR SHARE",
+        "SELECT id, user_id FROM phone_numbers WHERE phone_number = $1 AND active AND user_id IS NOT NULL AND (vip_expires_at IS NULL OR vip_expires_at > now()) FOR SHARE",
         [message.to]
       );
       if (number.rowCount === 0) {
@@ -1507,18 +1746,52 @@ const errorHandler = (error, _req, res, _next) => {
 };
 app.use(errorHandler);
 
+async function retryPendingVipPurchases() {
+  if (process.env.AUTO_PROVISION_TELNYX !== "true") return;
+  const pending = await pool.query(
+    `SELECT purchase_token_hash, user_id, product_id
+     FROM vip_purchases
+     WHERE status = 'pending_provision'
+     ORDER BY created_at
+     LIMIT 10`
+  );
+  for (const purchase of pending.rows) {
+    try {
+      await fulfillVipPurchase({
+        tokenHash: purchase.purchase_token_hash,
+        userId: purchase.user_id,
+        productId: purchase.product_id
+      });
+    } catch (error) {
+      console.error(
+        `VIP purchase retry failed for ${purchase.purchase_token_hash.slice(0, 12)}: ${error.message}`
+      );
+    }
+  }
+}
+
 async function start() {
   await pool.query(schema);
   await pool.query("DELETE FROM sms_messages WHERE created_at < now() - interval '24 hours'");
   await pool.query("DELETE FROM webhook_nonces WHERE received_at < now() - interval '24 hours'");
   await pool.query("DELETE FROM phone_auth_challenges WHERE expires_at < now()");
   await pool.query("DELETE FROM ad_reward_tokens WHERE expires_at < now() OR used_at < now() - interval '24 hours'");
+  await pool.query(
+    `UPDATE phone_numbers SET active = false
+     WHERE number_type = 'VIP_PRIVATE' AND user_id IS NOT NULL
+       AND active AND vip_expires_at <= now()`
+  );
   const cleanup = setInterval(async () => {
     try {
       await pool.query("DELETE FROM sms_messages WHERE created_at < now() - interval '24 hours'");
       await pool.query("DELETE FROM webhook_nonces WHERE received_at < now() - interval '24 hours'");
       await pool.query("DELETE FROM phone_auth_challenges WHERE expires_at < now()");
       await pool.query("DELETE FROM ad_reward_tokens WHERE expires_at < now() OR used_at < now() - interval '24 hours'");
+      await pool.query(
+        `UPDATE phone_numbers SET active = false
+         WHERE number_type = 'VIP_PRIVATE' AND user_id IS NOT NULL
+           AND active AND vip_expires_at <= now()`
+      );
     } catch (error) {
       console.error(`Cleanup failed: ${error.message}`);
     }
@@ -1527,6 +1800,22 @@ async function start() {
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`VirtualSIM backend listening on ${PORT}`);
   });
+  let retryingVipPurchases = false;
+  const runVipProvisionRetries = async () => {
+    if (retryingVipPurchases) return;
+    retryingVipPurchases = true;
+    try {
+      await retryPendingVipPurchases();
+    } catch (error) {
+      console.error(`VIP purchase retry scan failed: ${error.message}`);
+    } finally {
+      retryingVipPurchases = false;
+    }
+  };
+  const vipRetryTimer = setInterval(runVipProvisionRetries, 5 * 60 * 1000);
+  vipRetryTimer.unref();
+  setImmediate(runVipProvisionRetries);
+  server.on("close", () => clearInterval(vipRetryTimer));
   if (TELNYX_API_KEY) {
     let syncing = false;
     const runTelnyxSync = async () => {
