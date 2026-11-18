@@ -1124,23 +1124,50 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
 });
 
 app.post("/api/vip/purchase", authenticate, async (req, res, next) => {
-  const { phoneNumber } = req.body;
-  if (!phoneNumber) return res.status(400).json({ error: "Phone number is required." });
+  const { numberId } = req.body;
+  if (!numberId) return res.status(400).json({ error: "Number ID is required." });
 
+  const client = await pool.connect();
   try {
-    // 1. Purchase via Telnyx
-    const order = await purchasePhoneNumber(phoneNumber);
-    
-    // 2. Save to database
-    await pool.query(
-      `INSERT INTO phone_numbers (phone_number, country, number_type, active, telnyx_phone_number_id, created_at)
-       VALUES ($1, $2, 'VIP_PRIVATE', true, $3, now())`,
-      [phoneNumber, "Purchased", order.id]
+    await client.query("BEGIN");
+
+    // 1. Verify number availability
+    const resNum = await client.query(
+      `SELECT id, telnyx_phone_number_id, phone_number
+       FROM phone_numbers
+       WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
+       FOR UPDATE`,
+      [numberId]
     );
 
-    res.json({ success: true, order });
+    if (resNum.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The selected VIP number is no longer available." });
+    }
+
+    const number = resNum.rows[0];
+
+    // 2. Assign to user
+    await client.query(
+      "UPDATE phone_numbers SET user_id = $1 WHERE id = $2",
+      [req.user.id, numberId]
+    );
+
+    // 3. Update connection
+    if (isSipProvisioningConfigured()) {
+       const sipAccount = await ensureTelnyxSipAccount(req.user.id);
+       await updatePhoneNumberConnection(number.telnyx_phone_number_id, sipAccount);
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true });
   } catch (error) {
+    await client.query("ROLLBACK");
     next(error);
+  } finally {
+    client.release();
   }
 });
 
