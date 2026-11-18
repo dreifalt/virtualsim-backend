@@ -1047,31 +1047,6 @@ app.get("/api/numbers", authenticate, async (req, res, next) => {
   }
 });
 
-app.get("/api/numbers/vip", authenticate, async (_req, res, next) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, country, city, dialing_code, phone_number, flag
-       FROM phone_numbers
-       WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-         AND telnyx_phone_number_id IS NOT NULL
-         AND (vip_expires_at IS NULL OR vip_expires_at > now())
-       ORDER BY country, city, phone_number`
-    );
-    return res.json({
-      numbers: result.rows.map((row) => ({
-        id: row.id,
-        country: row.country,
-        city: row.city,
-        dialingCode: row.dialing_code,
-        number: row.phone_number,
-        flag: row.flag
-      }))
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
-
 app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
   const numberId = String(req.body?.numberId || "").trim();
   if (!numberId) return res.status(400).json({ error: "Select an available VIP number." });
@@ -1273,6 +1248,7 @@ async function getVipNumbersHandler(_req, res, next) {
 
 app.get("/api/vip/numbers", authenticate, getVipNumbersHandler);
 app.get("/api/vip/available", authenticate, getVipNumbersHandler);
+app.get("/api/numbers/vip", authenticate, getVipNumbersHandler);
 
 app.post("/api/vip/purchase", authenticate, async (req, res, next) => {
   const { numberId } = req.body;
