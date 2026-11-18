@@ -252,7 +252,15 @@ async function getAvailablePhoneNumbers(countries) {
         "page[size]": "2",
         "page[number]": String(pageNumber)
       });
-      const response = await telnyxRequest(`/available_phone_numbers?${query}`);
+      let response;
+      try {
+        response = await telnyxRequest(`/available_phone_numbers?${query}`);
+      } catch (error) {
+        if (error instanceof TelnyxApiError) {
+          break;
+        }
+        throw error;
+      }
       if (!response || !Array.isArray(response.data)) {
         throw new TelnyxApiError(502, "Telnyx returned an invalid available-phone-number inventory.");
       }

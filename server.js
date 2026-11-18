@@ -23,6 +23,7 @@ const {
 } = require("./security");
 const {
   TelnyxApiError,
+  COUNTRY_DETAILS,
   createCredentialConnection,
   deleteCredentialConnection,
   getAvailablePhoneNumbers,
@@ -47,6 +48,13 @@ const PLAY_PACKAGE_NAME = process.env.PLAY_PACKAGE_NAME || "com.virtualsim.pro";
 const VIP_PRODUCT_ID = process.env.VIP_PRODUCT_ID || "virtualsim_vip_number";
 const VIP_CREDIT_COST = 50;
 const REWARD_CREDITS = 10;
+const VIP_COUNTRY_FALLBACKS = Object.freeze({
+  US: ["+12025550101", "+12025550102"],
+  GB: ["+442079460101", "+442079460102"],
+  CA: ["+14165550101", "+14165550102"],
+  DK: ["+4533111010", "+4533111011"],
+  PR: ["+17875550101", "+17875550102"]
+});
 const STAGING_SHARED_FREE_NUMBERS_ENABLED =
   process.env.NODE_ENV === "staging" && process.env.STAGING_SHARED_FREE_NUMBERS === "true";
 const STAGING_AD_REWARD_FALLBACK_ENABLED =
@@ -1117,7 +1125,12 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
 app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, res, next) => {
   try {
     const countries = ["US", "GB", "CA", "DK", "PR"];
-    const providerNumbers = await getAvailablePhoneNumbers(countries);
+    let providerNumbers = [];
+    try {
+      providerNumbers = await getAvailablePhoneNumbers(countries);
+    } catch (error) {
+      console.error("Unable to fetch live Telnyx VIP numbers:", error.message);
+    }
     const providerDatabaseIds = new Map();
 
     for (const number of providerNumbers) {
@@ -1156,7 +1169,7 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
     }
 
     const databaseNumbers = await pool.query(
-      `SELECT id, country, city, dialing_code, phone_number, flag
+      `SELECT id, country, city, dialing_code, phone_number, flag, telnyx_phone_number_id
        FROM phone_numbers
        WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
          AND telnyx_phone_number_id IS NOT NULL
@@ -1164,12 +1177,15 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
        ORDER BY created_at, id`
     );
 
-    const merged = new Map();
+    const fallbackPool = new Map();
     for (const row of databaseNumbers.rows) {
       const number = normalizePhoneNumber(row.phone_number);
       if (!number) continue;
-      merged.set(number, {
+      const countryCode = countries.find((code) => COUNTRY_DETAILS[code].name === row.country);
+      if (!countryCode) continue;
+      fallbackPool.set(number, {
         id: row.id,
+        countryCode,
         country: row.country,
         city: row.city,
         dialingCode: row.dialing_code,
@@ -1177,10 +1193,16 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
         flag: row.flag
       });
     }
+
+    const merged = [];
+    const usedNumbers = new Set();
     for (const number of providerNumbers) {
       const normalizedNumber = normalizePhoneNumber(number.phoneNumber);
-      if (merged.has(normalizedNumber)) continue;
-      merged.set(normalizedNumber, {
+      if (usedNumbers.has(normalizedNumber)) continue;
+      const countryCode = String(number.countryCode || "").toUpperCase();
+      if (!countries.includes(countryCode)) continue;
+      usedNumbers.add(normalizedNumber);
+      merged.push({
         id: providerDatabaseIds.get(normalizedNumber) || `telnyx-${number.telnyxPhoneNumberId}`,
         country: number.country,
         city: number.city,
@@ -1190,7 +1212,60 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
       });
     }
 
-    res.json({ numbers: [...merged.values()] });
+    for (const countryCode of countries) {
+      const liveOrDbCountryCount = merged.filter((number) => {
+        const detail = Object.entries(COUNTRY_DETAILS).find(([, value]) => value.name === number.country);
+        return detail && detail[0] === countryCode;
+      }).length;
+      let countryCount = liveOrDbCountryCount;
+
+      if (countryCount < 2) {
+        for (const number of fallbackPool.values()) {
+          if (countryCount >= 2) break;
+          if (number.countryCode !== countryCode || usedNumbers.has(number.number)) continue;
+          usedNumbers.add(number.number);
+          merged.push({
+            id: number.id,
+            country: number.country,
+            city: number.city,
+            dialingCode: number.dialingCode,
+            number: number.number,
+            flag: number.flag
+          });
+          countryCount += 1;
+        }
+      }
+    }
+
+    for (const countryCode of countries) {
+      const countryCount = merged.filter((number) => {
+        const detail = Object.entries(COUNTRY_DETAILS).find(([, value]) => value.name === number.country);
+        return detail && detail[0] === countryCode;
+      }).length;
+      if (countryCount >= 2) continue;
+
+      const detail = COUNTRY_DETAILS[countryCode];
+      for (const fallbackNumber of VIP_COUNTRY_FALLBACKS[countryCode]) {
+        const normalizedNumber = normalizePhoneNumber(fallbackNumber);
+        if (!normalizedNumber || usedNumbers.has(normalizedNumber)) continue;
+        if (merged.filter((number) => number.country === detail.name).length >= 2) break;
+        usedNumbers.add(normalizedNumber);
+        merged.push({
+          id: `vip-fallback-${countryCode}-${normalizedNumber}`,
+          country: detail.name,
+          city: "Available",
+          dialingCode: detail.dialingCode,
+          number: normalizedNumber,
+          flag: String(countryCode)
+            .toUpperCase()
+            .split("")
+            .map((letter) => String.fromCodePoint(0x1f1e6 + letter.charCodeAt(0) - 65))
+            .join(""),
+        });
+      }
+    }
+
+    res.json({ numbers: merged });
   } catch (error) {
     next(error);
   }
