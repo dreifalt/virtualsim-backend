@@ -407,6 +407,10 @@ async function syncTelnyxInventory() {
   return telnyxSyncStatus;
 }
 
+app.get("/", (_req, res) => {
+  return res.status(200).json({ status: "ok" });
+});
+
 app.get("/health", async (_req, res, next) => {
   try {
     await pool.query("SELECT 1");
