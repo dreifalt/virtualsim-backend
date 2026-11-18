@@ -25,6 +25,7 @@ const {
   TelnyxApiError,
   createCredentialConnection,
   deleteCredentialConnection,
+  getAvailablePhoneNumbers,
   inventoryRecord,
   isSipProvisioningConfigured,
   listPurchasedNumbers,
@@ -1116,8 +1117,69 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
 app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, res, next) => {
   try {
     const countries = ["US", "GB", "CA", "DK", "PR"];
-    const availableNumbers = await getAvailablePhoneNumbers(countries);
-    res.json({ numbers: availableNumbers });
+    const providerNumbers = await getAvailablePhoneNumbers(countries);
+
+    for (const number of providerNumbers) {
+      await pool.query(
+        `INSERT INTO phone_numbers
+         (id, phone_number, country, city, dialing_code, flag, number_type,
+          telnyx_phone_number_id, active)
+         VALUES ($1, $2, $3, $4, $5, $6, 'VIP_PRIVATE', $7, true)
+         ON CONFLICT (phone_number) DO UPDATE SET
+           country = EXCLUDED.country,
+           city = EXCLUDED.city,
+           dialing_code = EXCLUDED.dialing_code,
+           flag = EXCLUDED.flag,
+           number_type = 'VIP_PRIVATE',
+           telnyx_phone_number_id = EXCLUDED.telnyx_phone_number_id,
+           active = true`,
+        [
+          `telnyx-${number.telnyxPhoneNumberId}`,
+          number.phoneNumber,
+          number.country,
+          number.city,
+          number.dialingCode,
+          number.flag,
+          number.telnyxPhoneNumberId
+        ]
+      );
+    }
+
+    const databaseNumbers = await pool.query(
+      `SELECT id, country, city, dialing_code, phone_number, flag
+       FROM phone_numbers
+       WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
+       ORDER BY created_at, id`
+    );
+
+    const merged = new Map();
+    for (const row of databaseNumbers.rows) {
+      const number = normalizePhoneNumber(row.phone_number);
+      if (!number) continue;
+      merged.set(number, {
+        id: row.id,
+        country: row.country,
+        city: row.city,
+        dialingCode: row.dialing_code,
+        number,
+        flag: row.flag
+      });
+    }
+    for (const number of providerNumbers) {
+      if (merged.has(number.phoneNumber)) continue;
+      merged.set(number.phoneNumber, {
+        id: `telnyx-${number.telnyxPhoneNumberId}`,
+        country: number.country,
+        city: number.city,
+        dialingCode: number.dialingCode,
+        number: number.phoneNumber,
+        flag: number.flag
+      });
+    }
+
+    res.json({ numbers: [...merged.values()] });
   } catch (error) {
     next(error);
   }

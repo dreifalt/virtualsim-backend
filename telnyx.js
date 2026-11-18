@@ -22,7 +22,8 @@ const COUNTRY_DETAILS = Object.freeze({
   IT: { name: "Italy", dialingCode: "+39" },
   NO: { name: "Norway", dialingCode: "+47" },
   PL: { name: "Poland", dialingCode: "+48" },
-  PT: { name: "Portugal", dialingCode: "+351" }
+  PT: { name: "Portugal", dialingCode: "+351" },
+  PR: { name: "Puerto Rico", dialingCode: "+1" }
 });
 
 class TelnyxApiError extends Error {
@@ -237,11 +238,50 @@ async function deleteCredentialConnection(connectionId) {
 }
 
 async function getAvailablePhoneNumbers(countries) {
-  const query = new URLSearchParams();
-  countries.forEach((code) => query.append("filter[country_code]", code));
-  query.append("filter[number_type]", "local");
-  const response = await telnyxRequest(`/available_phone_numbers?${query}`);
-  return response.data || [];
+  const countryCodes = [...new Set((countries || []).map((code) => String(code).toUpperCase()).filter(Boolean))];
+  const numbers = [];
+
+  for (const countryCode of countryCodes) {
+    const country = COUNTRY_DETAILS[countryCode];
+    if (!country) continue;
+
+    for (let pageNumber = 1; pageNumber <= 10 && numbers.filter((number) => number.countryCode === countryCode).length < 2; pageNumber += 1) {
+      const query = new URLSearchParams({
+        "filter[country_code]": countryCode,
+        "filter[number_type]": "local",
+        "page[size]": "2",
+        "page[number]": String(pageNumber)
+      });
+      const response = await telnyxRequest(`/available_phone_numbers?${query}`);
+      if (!response || !Array.isArray(response.data)) {
+        throw new TelnyxApiError(502, "Telnyx returned an invalid available-phone-number inventory.");
+      }
+      if (response.data.length === 0) break;
+
+      for (const record of response.data) {
+        const phoneNumber = normalizePhoneNumber(record.phone_number || record.phoneNumber);
+        if (!phoneNumber) continue;
+        if (numbers.some((number) => number.phoneNumber === phoneNumber)) continue;
+        numbers.push({
+          telnyxPhoneNumberId: String(record.id || record.phone_number_id || phoneNumber),
+          phoneNumber,
+          country: country.name,
+          countryCode,
+          city: String(record.locality || record.city || record.region || "").slice(0, 80),
+          dialingCode: country.dialingCode,
+          flag: countryFlag(countryCode),
+          numberType: "VIP_PRIVATE"
+        });
+        if (numbers.filter((number) => number.countryCode === countryCode).length >= 2) break;
+      }
+
+      const totalPages = Number(response.meta && response.meta.total_pages);
+      if (Number.isInteger(totalPages) && pageNumber >= totalPages) break;
+      if (!Number.isInteger(totalPages) && response.data.length < 2) break;
+    }
+  }
+
+  return numbers;
 }
 
 async function purchasePhoneNumber(phoneNumber) {
