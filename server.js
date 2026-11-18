@@ -1118,9 +1118,11 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
   try {
     const countries = ["US", "GB", "CA", "DK", "PR"];
     const providerNumbers = await getAvailablePhoneNumbers(countries);
+    const providerDatabaseIds = new Map();
 
     for (const number of providerNumbers) {
-      await pool.query(
+      const normalizedNumber = normalizePhoneNumber(number.phoneNumber);
+      const upserted = await pool.query(
         `INSERT INTO phone_numbers
          (id, phone_number, country, city, dialing_code, flag, number_type,
           telnyx_phone_number_id, active)
@@ -1132,7 +1134,11 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
            flag = EXCLUDED.flag,
            number_type = 'VIP_PRIVATE',
            telnyx_phone_number_id = EXCLUDED.telnyx_phone_number_id,
-           active = true`,
+           user_id = NULL,
+           telnyx_connection_id = NULL,
+           vip_expires_at = NULL,
+           active = true
+         RETURNING id, phone_number`,
         [
           `telnyx-${number.telnyxPhoneNumberId}`,
           number.phoneNumber,
@@ -1143,6 +1149,10 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
           number.telnyxPhoneNumberId
         ]
       );
+      const savedId = upserted.rows && upserted.rows[0]
+        ? upserted.rows[0].id
+        : `telnyx-${number.telnyxPhoneNumberId}`;
+      providerDatabaseIds.set(normalizedNumber, savedId);
     }
 
     const databaseNumbers = await pool.query(
@@ -1168,9 +1178,10 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
       });
     }
     for (const number of providerNumbers) {
-      if (merged.has(number.phoneNumber)) continue;
-      merged.set(number.phoneNumber, {
-        id: `telnyx-${number.telnyxPhoneNumberId}`,
+      const normalizedNumber = normalizePhoneNumber(number.phoneNumber);
+      if (merged.has(normalizedNumber)) continue;
+      merged.set(normalizedNumber, {
+        id: providerDatabaseIds.get(normalizedNumber) || `telnyx-${number.telnyxPhoneNumberId}`,
         country: number.country,
         city: number.city,
         dialingCode: number.dialingCode,
