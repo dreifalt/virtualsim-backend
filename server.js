@@ -1051,51 +1051,63 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
   const numberId = String(req.body?.numberId || "").trim();
   if (!numberId) return res.status(400).json({ error: "Select an available VIP number." });
 
-  let sipAccount = null;
-  try {
-    const user = await pool.query("SELECT credits FROM users WHERE id = $1", [req.user.id]);
-    if (user.rowCount === 0) return res.status(404).json({ error: "User not found." });
-    if (user.rows[0].credits < VIP_CREDIT_COST) {
-      return res.status(402).json({ error: "You need 50 credits to unlock a VIP number." });
-    }
-    const number = await pool.query(
-      `SELECT 1 FROM phone_numbers
-       WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-         AND telnyx_phone_number_id IS NOT NULL
-         AND (vip_expires_at IS NULL OR vip_expires_at > now())`,
-      [numberId]
-    );
-    if (number.rowCount === 0) {
-      return res.status(409).json({ error: "The selected VIP number is no longer available." });
-    }
-    if (isSipProvisioningConfigured()) {
-      sipAccount = await ensureTelnyxSipAccount(req.user.id);
-    }
-  } catch (error) {
-    return next(error);
-  }
-
   const client = await pool.connect();
-  let transactionStarted = false;
-  let attachedNumberId = null;
-  let committed = false;
   try {
     await client.query("BEGIN");
-    transactionStarted = true;
     const user = await client.query(
       "SELECT credits FROM users WHERE id = $1 FOR UPDATE",
       [req.user.id]
     );
     if (user.rowCount === 0) {
       await client.query("ROLLBACK");
-      transactionStarted = false;
       return res.status(404).json({ error: "User not found." });
     }
     if (user.rows[0].credits < VIP_CREDIT_COST) {
       await client.query("ROLLBACK");
-      transactionStarted = false;
       return res.status(402).json({ error: "You need 50 credits to unlock a VIP number." });
     }
+
+    const number = await client.query(
+      `SELECT id, telnyx_phone_number_id
+       FROM phone_numbers
+       WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
+         AND telnyx_phone_number_id IS NOT NULL
+         AND (vip_expires_at IS NULL OR vip_expires_at > now())
+       FOR UPDATE`,
+      [numberId]
+    );
+    if (number.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The selected VIP number is no longer available." });
+    }
+
+    let sipAccount = null;
+    if (isSipProvisioningConfigured()) {
+      sipAccount = await ensureTelnyxSipAccount(req.user.id);
+    }
+    if (sipAccount && number.rows[0].telnyx_phone_number_id) {
+      await updatePhoneNumberConnection(number.rows[0].telnyx_phone_number_id, sipAccount);
+    }
+    await client.query(
+      `UPDATE phone_numbers
+       SET user_id = $1, telnyx_connection_id = $2,
+           vip_expires_at = now() + interval '30 days'
+       WHERE id = $3`,
+      [req.user.id, sipAccount ? sipAccount.connectionId : null, numberId]
+    );
+    await client.query(
+      "UPDATE users SET credits = credits - $1 WHERE id = $2",
+      [VIP_CREDIT_COST, req.user.id]
+    );
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    next(error);
+  } finally {
+    client.release();
+  }
+});
 
 async function getVipNumbersHandler(_req, res, next) {
   try {
@@ -1106,8 +1118,8 @@ async function getVipNumbersHandler(_req, res, next) {
     } catch (error) {
       console.error("Unable to fetch live Telnyx VIP numbers:", error.message);
     }
-    const providerDatabaseIds = new Map();
 
+    const providerDatabaseIds = new Map();
     for (const number of providerNumbers) {
       const normalizedNumber = normalizePhoneNumber(number.phoneNumber);
       const upserted = await pool.query(
@@ -1126,7 +1138,7 @@ async function getVipNumbersHandler(_req, res, next) {
            telnyx_connection_id = NULL,
            vip_expires_at = NULL,
            active = true
-         RETURNING id, phone_number`,
+         RETURNING id`,
         [
           `telnyx-${number.telnyxPhoneNumberId}`,
           number.phoneNumber,
@@ -1137,14 +1149,11 @@ async function getVipNumbersHandler(_req, res, next) {
           number.telnyxPhoneNumberId
         ]
       );
-      const savedId = upserted.rows && upserted.rows[0]
-        ? upserted.rows[0].id
-        : `telnyx-${number.telnyxPhoneNumberId}`;
-      providerDatabaseIds.set(normalizedNumber, savedId);
+      providerDatabaseIds.set(normalizedNumber, upserted.rows[0]?.id || `telnyx-${number.telnyxPhoneNumberId}`);
     }
 
     const databaseNumbers = await pool.query(
-      `SELECT id, country, city, dialing_code, phone_number, flag, telnyx_phone_number_id
+      `SELECT id, country, city, dialing_code, phone_number, flag
        FROM phone_numbers
        WHERE user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
          AND telnyx_phone_number_id IS NOT NULL
@@ -1157,8 +1166,7 @@ async function getVipNumbersHandler(_req, res, next) {
       const number = normalizePhoneNumber(row.phone_number);
       if (!number) continue;
       const countryCode = countries.find((code) => COUNTRY_DETAILS[code].name === row.country);
-      if (!countryCode) continue;
-      fallbackPool.set(number, {
+      if (countryCode) fallbackPool.set(number, {
         id: row.id,
         countryCode,
         country: row.country,
@@ -1173,57 +1181,44 @@ async function getVipNumbersHandler(_req, res, next) {
     const usedNumbers = new Set();
     for (const number of providerNumbers) {
       const normalizedNumber = normalizePhoneNumber(number.phoneNumber);
-      if (usedNumbers.has(normalizedNumber)) continue;
-      const countryCode = String(number.countryCode || "").toUpperCase();
-      if (!countries.includes(countryCode)) continue;
+      if (!normalizedNumber || usedNumbers.has(normalizedNumber)) continue;
       usedNumbers.add(normalizedNumber);
       merged.push({
         id: providerDatabaseIds.get(normalizedNumber) || `telnyx-${number.telnyxPhoneNumberId}`,
         country: number.country,
         city: number.city,
         dialingCode: number.dialingCode,
-        number: number.phoneNumber,
+        number: normalizedNumber,
         flag: number.flag
       });
     }
 
     for (const countryCode of countries) {
-      const liveOrDbCountryCount = merged.filter((number) => {
-        const detail = Object.entries(COUNTRY_DETAILS).find(([, value]) => value.name === number.country);
-        return detail && detail[0] === countryCode;
-      }).length;
-      let countryCount = liveOrDbCountryCount;
-
-      if (countryCount < 2) {
-        for (const number of fallbackPool.values()) {
-          if (countryCount >= 2) break;
-          if (number.countryCode !== countryCode || usedNumbers.has(number.number)) continue;
-          usedNumbers.add(number.number);
-          merged.push({
-            id: number.id,
-            country: number.country,
-            city: number.city,
-            dialingCode: number.dialingCode,
-            number: number.number,
-            flag: number.flag
-          });
-          countryCount += 1;
-        }
+      const detail = COUNTRY_DETAILS[countryCode];
+      let countryCount = merged.filter((number) => number.country === detail.name).length;
+      for (const fallback of fallbackPool.values()) {
+        if (countryCount >= 2) break;
+        if (fallback.countryCode !== countryCode || usedNumbers.has(fallback.number)) continue;
+        usedNumbers.add(fallback.number);
+        merged.push({
+          id: fallback.id,
+          country: fallback.country,
+          city: fallback.city,
+          dialingCode: fallback.dialingCode,
+          number: fallback.number,
+          flag: fallback.flag
+        });
+        countryCount += 1;
       }
     }
 
     for (const countryCode of countries) {
-      const countryCount = merged.filter((number) => {
-        const detail = Object.entries(COUNTRY_DETAILS).find(([, value]) => value.name === number.country);
-        return detail && detail[0] === countryCode;
-      }).length;
-      if (countryCount >= 2) continue;
-
       const detail = COUNTRY_DETAILS[countryCode];
-      for (const fallbackNumber of VIP_COUNTRY_FALLBACKS[countryCode]) {
+      let countryCount = merged.filter((number) => number.country === detail.name).length;
+      for (const fallbackNumber of VIP_COUNTRY_FALLBACKS[countryCode] || []) {
+        if (countryCount >= 2) break;
         const normalizedNumber = normalizePhoneNumber(fallbackNumber);
         if (!normalizedNumber || usedNumbers.has(normalizedNumber)) continue;
-        if (merged.filter((number) => number.country === detail.name).length >= 2) break;
         usedNumbers.add(normalizedNumber);
         merged.push({
           id: `vip-fallback-${countryCode}-${normalizedNumber}`,
@@ -1231,15 +1226,16 @@ async function getVipNumbersHandler(_req, res, next) {
           city: "Available",
           dialingCode: detail.dialingCode,
           number: normalizedNumber,
-          flag: String(countryCode)
-            .toUpperCase()
-            .split("")
-            .map((letter) => String.fromCodePoint(0x1f1e6 + letter.charCodeAt(0) - 65))
-            .join(""),
+          flag: String.fromCodePoint(
+            0x1f1e6 + countryCode.charCodeAt(0) - 65,
+            0x1f1e6 + countryCode.charCodeAt(1) - 65
+          )
         });
+        countryCount += 1;
       }
     }
 
+    res.set("Cache-Control", "no-store");
     res.json({ numbers: merged });
   } catch (error) {
     next(error);
@@ -1293,61 +1289,6 @@ app.post("/api/vip/purchase", authenticate, async (req, res, next) => {
   } catch (error) {
     await client.query("ROLLBACK");
     next(error);
-  } finally {
-    client.release();
-  }
-});
-
-
-    const number = await client.query(
-      `SELECT id, telnyx_phone_number_id FROM phone_numbers
-       WHERE id = $1 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-         AND telnyx_phone_number_id IS NOT NULL
-         AND (vip_expires_at IS NULL OR vip_expires_at > now())
-       FOR UPDATE SKIP LOCKED`,
-      [numberId]
-    );
-    if (number.rowCount === 0) {
-      await client.query("ROLLBACK");
-      transactionStarted = false;
-      return res.status(409).json({ error: "The selected VIP number is no longer available." });
-    }
-
-    const connectionId = sipAccount ? sipAccount.connectionId : null;
-    if (connectionId) {
-      attachedNumberId = number.rows[0].telnyx_phone_number_id;
-      await updatePhoneNumberConnection(attachedNumberId, connectionId);
-    }
-    const assigned = await client.query(
-      `UPDATE phone_numbers
-       SET user_id = $1, telnyx_connection_id = $2
-       WHERE id = $3 AND user_id IS NULL AND active AND number_type = 'VIP_PRIVATE'
-       RETURNING id`,
-      [req.user.id, connectionId, numberId]
-    );
-    if (assigned.rowCount === 0) throw new Error("The VIP number could not be assigned.");
-
-    const debit = await client.query(
-      "UPDATE users SET credits = credits - $1 WHERE id = $2 AND credits >= $1 RETURNING credits",
-      [VIP_CREDIT_COST, req.user.id]
-    );
-    if (debit.rowCount === 0) throw new Error("The VIP credit balance changed before assignment.");
-
-    await client.query("COMMIT");
-    transactionStarted = false;
-    committed = true;
-    attachedNumberId = null;
-    return res.json({ unlocked: true, numberId, credits: debit.rows[0].credits });
-  } catch (error) {
-    if (transactionStarted) await client.query("ROLLBACK");
-    if (attachedNumberId && !committed) {
-      try {
-        await updatePhoneNumberConnection(attachedNumberId, null);
-      } catch (cleanupError) {
-        console.error(`Unable to detach an unassigned VIP Telnyx number: ${cleanupError.message}`);
-      }
-    }
-    return next(error);
   } finally {
     client.release();
   }
