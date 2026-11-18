@@ -1122,7 +1122,7 @@ app.post("/api/numbers/unlock-vip", authenticate, async (req, res, next) => {
       return res.status(402).json({ error: "You need 50 credits to unlock a VIP number." });
     }
 
-app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, res, next) => {
+async function getVipNumbersHandler(_req, res, next) {
   try {
     const countries = ["US", "GB", "CA", "DK", "PR"];
     let providerNumbers = [];
@@ -1269,7 +1269,10 @@ app.get(["/api/vip/available", "/api/vip/numbers"], authenticate, async (_req, r
   } catch (error) {
     next(error);
   }
-});
+}
+
+app.get("/api/vip/numbers", authenticate, getVipNumbersHandler);
+app.get("/api/vip/available", authenticate, getVipNumbersHandler);
 
 app.post("/api/vip/purchase", authenticate, async (req, res, next) => {
   const { numberId } = req.body;
