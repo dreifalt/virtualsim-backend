@@ -44,9 +44,17 @@ const smtpTransporter = process.env.SMTP_USER && process.env.SMTP_PASS
       ? {
           host: process.env.SMTP_HOST,
           port: Number(process.env.SMTP_PORT || 587),
-          secure: process.env.SMTP_SECURE === "true" || Number(process.env.SMTP_PORT) === 465
+          secure: process.env.SMTP_SECURE === "true" || Number(process.env.SMTP_PORT) === 465,
+          connectionTimeout: 8000,
+          greetingTimeout: 8000,
+          socketTimeout: 10000
         }
-      : { service: "gmail" }),
+      : {
+          service: "gmail",
+          connectionTimeout: 8000,
+          greetingTimeout: 8000,
+          socketTimeout: 10000
+        }),
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
   })
   : null;
@@ -994,19 +1002,40 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
     const code = String(crypto.randomInt(100000, 1000000));
     resetCodes.set(email, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
 
-    if (resend) {
+    const message = {
+      to: email,
+      subject: "Your Password Reset Code",
+      text: `Your password reset code is: ${code}. It expires in 10 minutes.`
+    };
+
+    if (smtpTransporter) {
+      try {
+        await smtpTransporter.sendMail({
+          ...message,
+          from: process.env.SMTP_FROM || `"VirtualSIM" <${process.env.SMTP_USER}>`
+        });
+      } catch (smtpError) {
+        console.error("SMTP password-reset email failed:", smtpError.message);
+        if (!resend) {
+          resetCodes.delete(email);
+          return res.status(503).json({ error: "Password reset email could not be sent. Please try again." });
+        }
+        try {
+          const result = await resend.emails.send({
+            ...message,
+            from: "VirtualSIM <verify@virtualsim.pro>"
+          });
+          if (result.error) throw result.error;
+        } catch (fallbackError) {
+          resetCodes.delete(email);
+          console.error("Resend password-reset fallback failed:", fallbackError.message);
+          return res.status(503).json({ error: "Password reset email could not be sent. Please try again." });
+        }
+      }
+    } else if (resend) {
       await resend.emails.send({
-        from: "VirtualSIM <verify@virtualsim.pro>",
-        to: email,
-        subject: "Your Password Reset Code",
-        text: `Your password reset code is: ${code}. It expires in 10 minutes.`
-      });
-    } else if (smtpTransporter) {
-      await smtpTransporter.sendMail({
-        from: process.env.SMTP_FROM || `"VirtualSIM" <${process.env.SMTP_USER}>`,
-        to: email,
-        subject: "Your Password Reset Code",
-        text: `Your password reset code is: ${code}. It expires in 10 minutes.`
+        ...message,
+        from: "VirtualSIM <verify@virtualsim.pro>"
       });
     } else {
       console.log(`Development reset code: ${code}`);
