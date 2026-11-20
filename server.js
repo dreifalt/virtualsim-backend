@@ -168,6 +168,9 @@ ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
 ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_at timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled boolean NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_code text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_expires_at timestamptz;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_identity_check') THEN
@@ -299,6 +302,33 @@ function createToken(user) {
   );
 }
 
+async function sendBrevoEmail({ to, subject, text }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.SMTP_USER || process.env.BREVO_SENDER_EMAIL;
+  if (!apiKey || !senderEmail) {
+    throw new Error("Brevo email is not configured.");
+  }
+
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "api-key": apiKey,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      sender: { name: "VirtualSIM", email: senderEmail },
+      to: [{ email: to }],
+      subject,
+      textContent: text
+    }),
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!response.ok) {
+    throw new Error(`Brevo API rejected email delivery (${response.status}).`);
+  }
+}
+
 async function authenticate(req, res, next) {
   res.set("Cache-Control", "no-store");
   const match = req.get("authorization")?.match(/^Bearer (.+)$/i);
@@ -306,7 +336,7 @@ async function authenticate(req, res, next) {
   try {
     const claims = jwt.verify(match[1], JWT_SECRET, { issuer: "virtualsim-master" });
     const result = await pool.query(
-      "SELECT id, email, phone_number, credits, token_version FROM users WHERE id = $1",
+      "SELECT id, email, phone_number, credits, token_version, two_factor_enabled FROM users WHERE id = $1",
       [claims.sub]
     );
     const user = result.rows[0];
@@ -974,12 +1004,39 @@ app.post("/api/auth/login", authLimiter, async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body.email);
     const result = await pool.query(
-      "SELECT id, email, phone_number, password_hash, credits, token_version FROM users WHERE email = $1",
+      "SELECT id, email, phone_number, password_hash, credits, token_version, two_factor_enabled FROM users WHERE email = $1",
       [email]
     );
     const user = result.rows[0];
     const valid = await bcrypt.compare(String(req.body.password || ""), user?.password_hash || dummyPasswordHash);
     if (!user || !valid) return res.status(401).json({ error: "Email or password is incorrect." });
+
+    if (user.two_factor_enabled) {
+      const code = String(crypto.randomInt(100000, 1000000));
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await pool.query(
+        "UPDATE users SET two_factor_code = $1, two_factor_expires_at = $2 WHERE id = $3",
+        [code, expiresAt, user.id]
+      );
+
+      try {
+        await sendBrevoEmail({
+          to: email,
+          subject: "Your Login Verification Code",
+          text: `Your login verification code is: ${code}. It expires in 10 minutes.`
+        });
+      } catch (brevoError) {
+        await pool.query(
+          "UPDATE users SET two_factor_code = NULL, two_factor_expires_at = NULL WHERE id = $1",
+          [user.id]
+        );
+        console.error("2FA Brevo email failed:", brevoError.message);
+        return res.status(503).json({ error: "Login verification email could not be sent." });
+      }
+
+      return res.json({ requires2fa: true, email });
+    }
+
     const hasVipNumber = await userHasActiveVipNumber(user.id);
     return res.json({
       token: createToken(user),
@@ -1010,25 +1067,7 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
 
     if (process.env.BREVO_API_KEY) {
       try {
-        const senderEmail = process.env.SMTP_USER || process.env.BREVO_SENDER_EMAIL;
-        const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-          method: "POST",
-          headers: {
-            accept: "application/json",
-            "api-key": process.env.BREVO_API_KEY,
-            "content-type": "application/json"
-          },
-          body: JSON.stringify({
-            sender: { name: "VirtualSIM", email: senderEmail },
-            to: [{ email }],
-            subject: message.subject,
-            textContent: message.text
-          })
-        });
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Brevo API error (${response.status}): ${errText}`);
-        }
+        await sendBrevoEmail(message);
       } catch (brevoError) {
         console.error("Brevo password-reset email failed:", brevoError.message);
         if (!resend) {
@@ -1129,6 +1168,66 @@ function publicProfile(user, vipAvailable = false, hasVipNumber = false) {
     hasVipNumber
   };
 }
+
+app.get("/api/auth/2fa/status", authenticate, async (req, res, next) => {
+  try {
+    return res.json({ twoFactorEnabled: Boolean(req.user.two_factor_enabled) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/auth/2fa/toggle", authenticate, async (req, res, next) => {
+  try {
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "The enabled field must be a boolean." });
+    }
+    if (enabled && !req.user.email) {
+      return res.status(400).json({ error: "Email 2FA requires an email account." });
+    }
+    if (enabled && (!process.env.BREVO_API_KEY ||
+        !(process.env.BREVO_SENDER_EMAIL || process.env.SMTP_USER))) {
+      return res.status(503).json({ error: "Email 2FA is not configured." });
+    }
+    await pool.query(
+      "UPDATE users SET two_factor_enabled = $1, two_factor_code = NULL, two_factor_expires_at = NULL WHERE id = $2",
+      [enabled, req.user.id]
+    );
+    return res.json({ success: true, twoFactorEnabled: enabled });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/auth/2fa/verify", authLimiter, async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const code = String(req.body?.code || "").trim();
+    if (!/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: "Email and 2FA code are required." });
+    }
+    const result = await pool.query(
+      `UPDATE users
+       SET two_factor_code = NULL, two_factor_expires_at = NULL
+       WHERE email = $1 AND two_factor_enabled AND two_factor_code = $2
+         AND two_factor_expires_at > now()
+       RETURNING id, email, phone_number, credits, token_version`,
+      [email, code]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return res.status(400).json({ error: "Invalid or expired 2FA code." });
+    }
+    const hasVipNumber = await userHasActiveVipNumber(user.id);
+    return res.json({
+      token: createToken(user),
+      profile: publicProfile(user, false, hasVipNumber)
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 app.get("/api/profile", authenticate, async (req, res, next) => {
   try {

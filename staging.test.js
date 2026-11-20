@@ -17,9 +17,16 @@ process.env.STAGING_AD_REWARD_FALLBACK = "true";
 let credits = 0;
 let fallbackGranted = false;
 Pool.prototype.query = async function (query) {
-  if (query.includes("SELECT id, email, phone_number, credits, token_version FROM users")) {
+  if (query.includes("SELECT id, email, phone_number, credits, token_version, two_factor_enabled FROM users")) {
     return {
-      rows: [{ id: "staging-user", email: "tester@example.invalid", phone_number: null, credits, token_version: 0 }],
+      rows: [{
+        id: "staging-user",
+        email: "tester@example.invalid",
+        phone_number: null,
+        credits,
+        token_version: 0,
+        two_factor_enabled: false
+      }],
       rowCount: 1
     };
   }
