@@ -1620,19 +1620,19 @@ app.get("/api/voip-config", authenticate, async (req, res, next) => {
       [req.user.id]
     );
     if (vip.rowCount === 0) {
-      return res.json({
+      return res.status(200).json({
         configured: false,
         message: "Unlock a VIP number (50 CR) to enable outbound VoIP calling"
       });
     }
     if (!vip.rows[0].telnyx_phone_number_id) {
-      return res.json({
+      return res.status(200).json({
         configured: false,
         message: "Your VIP number is not linked to Telnyx for outbound VoIP calling."
       });
     }
     if (!isSipProvisioningConfigured()) {
-      return res.json({
+      return res.status(200).json({
         configured: false,
         message: "Telnyx SIP provisioning is not configured for this VIP account."
       });
@@ -1663,9 +1663,9 @@ app.get("/api/voip-config", authenticate, async (req, res, next) => {
         );
         if (updated.rowCount === 0) {
           await restoreConnection();
-          return res.status(409).json({
+          return res.status(200).json({
             configured: false,
-            message: "The VIP number assignment changed. Refresh and retry."
+            message: "Unlock a VIP number to enable VoIP calling."
           });
         }
       } catch (error) {
