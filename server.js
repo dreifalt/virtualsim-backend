@@ -317,7 +317,7 @@ async function sendBrevoEmail({ to, subject, text }) {
       "content-type": "application/json"
     },
     body: JSON.stringify({
-      sender: { name: "VirtualSIM", email: senderEmail },
+      sender: { name: "Infinit eSIM", email: senderEmail },
       to: [{ email: to }],
       subject,
       textContent: text
@@ -876,7 +876,7 @@ app.post("/api/auth/phone/request", phoneOtpRequestLimiter, async (req, res, nex
     try {
       await sendSms({
         to: phoneNumber,
-        text: `Your VirtualSIM Pro sign-in code is ${code}. It expires in 10 minutes.`
+        text: `Your Infinit eSIM sign-in code is ${code}. It expires in 10 minutes.`
       });
     } catch (error) {
       try {
@@ -1077,7 +1077,7 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
         try {
           const result = await resend.emails.send({
             ...message,
-            from: "VirtualSIM <verify@virtualsim.pro>"
+            from: "Infinit eSIM <verify@virtualsim.pro>"
           });
           if (result.error) throw result.error;
         } catch (fallbackError) {
@@ -1090,7 +1090,7 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
       try {
         await smtpTransporter.sendMail({
           ...message,
-          from: process.env.SMTP_FROM || `"VirtualSIM" <${process.env.SMTP_USER}>`
+          from: process.env.SMTP_FROM || `"Infinit eSIM" <${process.env.SMTP_USER}>`
         });
       } catch (smtpError) {
         console.error("SMTP password-reset email failed:", smtpError.message);
@@ -1101,7 +1101,7 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
         try {
           const result = await resend.emails.send({
             ...message,
-            from: "VirtualSIM <verify@virtualsim.pro>"
+            from: "Infinit eSIM <verify@virtualsim.pro>"
           });
           if (result.error) throw result.error;
         } catch (fallbackError) {
@@ -1113,7 +1113,7 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
     } else if (resend) {
       await resend.emails.send({
         ...message,
-        from: "VirtualSIM <verify@virtualsim.pro>"
+        from: "Infinit eSIM <verify@virtualsim.pro>"
       });
     } else {
       console.log(`Development reset code: ${code}`);
