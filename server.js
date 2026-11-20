@@ -38,11 +38,18 @@ const {
 const { Resend } = require("resend");
 const nodemailer = require("nodemailer");
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-const smtpTransporter = (process.env.SMTP_HOST && process.env.SMTP_USER) ? nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-}) : null;
+const smtpTransporter = process.env.SMTP_USER && process.env.SMTP_PASS
+  ? nodemailer.createTransport({
+    ...(process.env.SMTP_HOST
+      ? {
+          host: process.env.SMTP_HOST,
+          port: Number(process.env.SMTP_PORT || 587),
+          secure: process.env.SMTP_SECURE === "true" || Number(process.env.SMTP_PORT) === 465
+        }
+      : { service: "gmail" }),
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+  })
+  : null;
 
 
 const PORT = Number(process.env.PORT || 3000);
@@ -996,7 +1003,7 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
       });
     } else if (smtpTransporter) {
       await smtpTransporter.sendMail({
-        from: '"VirtualSIM" <verify@virtualsim.pro>',
+        from: process.env.SMTP_FROM || `"VirtualSIM" <${process.env.SMTP_USER}>`,
         to: email,
         subject: "Your Password Reset Code",
         text: `Your password reset code is: ${code}. It expires in 10 minutes.`
