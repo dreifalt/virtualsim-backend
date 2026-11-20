@@ -19,6 +19,8 @@
     "googleapis": "^160.0.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.16.3"
+    "nodemailer": "^10.6.0",
+    "pg": "^8.16.3",
+    "resend": "^6.39.0"
   }
 }

@@ -35,6 +35,15 @@ const {
   telnyxRequest,
   updatePhoneNumberConnection
 } = require("./telnyx");
+const { Resend } = require("resend");
+const nodemailer = require("nodemailer");
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const smtpTransporter = (process.env.SMTP_HOST && process.env.SMTP_USER) ? nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+}) : null;
+
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1166,6 +1175,63 @@ async function getVipNumbersHandler(_req, res, next) {
       const number = normalizePhoneNumber(row.phone_number);
       if (!number) continue;
       const countryCode = countries.find((code) => COUNTRY_DETAILS[code].name === row.country);
+
+// Forgot Password
+const resetCodes = new Map(); // Store: email -> { code, expiresAt }
+
+app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
+  const { email } = req.body;
+  if (!email || !email.includes("@")) return res.status(400).json({ error: "Invalid email." });
+
+  try {
+    const user = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    if (user.rowCount === 0) return res.status(404).json({ error: "Email not found." });
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    resetCodes.set(email, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
+
+    if (resend) {
+        await resend.emails.send({
+            from: 'VirtualSIM <verify@virtualsim.pro>',
+            to: email,
+            subject: 'Your Password Reset Code',
+            text: `Your password reset code is: ${code}. It expires in 10 minutes.`
+        });
+    } else if (smtpTransporter) {
+        await smtpTransporter.sendMail({
+            from: '"VirtualSIM" <verify@virtualsim.pro>',
+            to: email,
+            subject: 'Your Password Reset Code',
+            text: `Your password reset code is: ${code}. It expires in 10 minutes.`
+        });
+    } else {
+        console.log(`Development reset code: ${code}`);
+    }
+
+    res.json({ message: "Code sent." });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/auth/password/reset", authLimiter, async (req, res, next) => {
+  const { email, code, newPassword } = req.body;
+  
+  const record = resetCodes.get(email);
+  if (!record || record.code !== code || Date.now() > record.expiresAt) {
+      return res.status(400).json({ error: "Invalid or expired code." });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    await pool.query("UPDATE users SET password = $1 WHERE email = $2", [hashedPassword, email]);
+    resetCodes.delete(email);
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
       if (countryCode) fallbackPool.set(number, {
         id: row.id,
         countryCode,
