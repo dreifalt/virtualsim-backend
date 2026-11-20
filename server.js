@@ -1008,7 +1008,46 @@ app.post("/api/auth/password/forgot", authLimiter, async (req, res, next) => {
       text: `Your password reset code is: ${code}. It expires in 10 minutes.`
     };
 
-    if (smtpTransporter) {
+    if (process.env.BREVO_API_KEY) {
+      try {
+        const senderEmail = process.env.SMTP_USER || process.env.BREVO_SENDER_EMAIL;
+        const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "api-key": process.env.BREVO_API_KEY,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            sender: { name: "VirtualSIM", email: senderEmail },
+            to: [{ email }],
+            subject: message.subject,
+            textContent: message.text
+          })
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Brevo API error (${response.status}): ${errText}`);
+        }
+      } catch (brevoError) {
+        console.error("Brevo password-reset email failed:", brevoError.message);
+        if (!resend) {
+          resetCodes.delete(email);
+          return res.status(503).json({ error: "Password reset email could not be sent. Please try again." });
+        }
+        try {
+          const result = await resend.emails.send({
+            ...message,
+            from: "VirtualSIM <verify@virtualsim.pro>"
+          });
+          if (result.error) throw result.error;
+        } catch (fallbackError) {
+          resetCodes.delete(email);
+          console.error("Resend password-reset fallback failed:", fallbackError.message);
+          return res.status(503).json({ error: "Password reset email could not be sent. Please try again." });
+        }
+      }
+    } else if (smtpTransporter) {
       try {
         await smtpTransporter.sendMail({
           ...message,
